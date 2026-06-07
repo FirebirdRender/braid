@@ -204,6 +204,7 @@ fn set_df_flag(socket: &Socket, is_ipv4: bool) -> std::io::Result<()> {
 /// Non-Linux: use socket2's built-in `set_dont_fragment()` if available,
 /// otherwise log a warning and skip.
 #[cfg(not(target_os = "linux"))]
+#[allow(unused_variables)]
 fn set_df_flag(socket: &Socket, _is_ipv4: bool) -> std::io::Result<()> {
     // socket2 provides set_dont_fragment() on some platforms
     #[cfg(any(
