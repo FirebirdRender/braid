@@ -136,7 +136,7 @@ async fn test_reassembly_to_orderer_pipeline() {
     );
 
     let reassembled = reassembly_rx.recv().await.unwrap();
-    orderer.push_chunk(reassembled);
+    orderer.push_chunk(reassembled).await;
 
     let ordered = orderer_rx.recv().await.unwrap();
     assert_eq!(ordered.data, data);
@@ -218,11 +218,11 @@ async fn test_full_pipeline_reassembly_to_commit() {
         fragment.extend_from_slice(&frag_header.to_bytes());
         fragment.extend_from_slice(&chunk_buf);
 
-    let completed = reassembler.add_fragment(fragment).await.unwrap();
+        let completed = reassembler.add_fragment(fragment).await.unwrap();
         assert!(completed);
 
         let reassembled = reassembly_rx.recv().await.unwrap();
-        orderer.push_chunk(reassembled);
+        orderer.push_chunk(reassembled).await;
     }
 
     drop(orderer);
