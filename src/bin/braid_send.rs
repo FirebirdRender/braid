@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,12 +9,16 @@ use tracing::{error, info, trace, warn};
 
 use braid::control::client::ControlClient;
 use braid::control::negotiation::{negotiate, NegotiationConfig};
+use braid::file_mode::sender::FileModeSender;
 use braid::flow::SenderReactor;
 use braid::progress::reporter::{ProgressReporter, ProgressVerbosity};
+use braid::protocol::ControlMessage;
 use braid::sender::queue::QueueManagerBuilder;
 use braid::sender::splitter::ChunkSplitter;
 use braid::sender::worker::{UdpSendWorker, UdpSendWorkerStats};
 use braid::shutdown::manager::ShutdownManager;
+
+use super::Mode;
 
 /// Default high-watermark for per-worker pending bytes (1 MB).
 const DEFAULT_HIGH_WATERMARK: u64 = 1024 * 1024;
@@ -47,9 +52,13 @@ pub struct BraidSend {
     mtu: usize,
     max_rate: u64,
     verbosity: ProgressVerbosity,
+    mode: Mode,
+    input: Option<PathBuf>,
 }
 
 impl BraidSend {
+    /// Construct a `BraidSend` for the default pipe mode (reads from stdin).
+    #[allow(dead_code)]
     pub fn new(
         destination: SocketAddr,
         chunk_size: usize,
@@ -58,6 +67,33 @@ impl BraidSend {
         max_rate: u64,
         verbosity: ProgressVerbosity,
     ) -> Self {
+        Self::new_with_mode(
+            destination,
+            chunk_size,
+            channels,
+            mtu,
+            max_rate,
+            verbosity,
+            Mode::Pipe,
+            None,
+        )
+    }
+
+    /// Construct a `BraidSend` with explicit mode and input selection.
+    ///
+    /// In `Mode::Pipe`, `input` must be `None`; the sender reads from stdin.
+    /// In `Mode::File`, `input` must be `Some(path)`; the sender reads from
+    /// the file and exchanges file-mode control messages with the receiver.
+    pub fn new_with_mode(
+        destination: SocketAddr,
+        chunk_size: usize,
+        channels: usize,
+        mtu: usize,
+        max_rate: u64,
+        verbosity: ProgressVerbosity,
+        mode: Mode,
+        input: Option<PathBuf>,
+    ) -> Self {
         Self {
             destination,
             chunk_size,
@@ -65,6 +101,8 @@ impl BraidSend {
             mtu,
             max_rate,
             verbosity,
+            mode,
+            input,
         }
     }
 
@@ -105,6 +143,43 @@ impl BraidSend {
             .map_err(|e| format!("negotiation failed: {e}"))?;
         let channels = result.channels;
         info!("negotiated {} channels", channels.len());
+
+        // ─── Step 3.5: File mode setup (after negotiation, before pipeline) ─
+        // In file mode, exchange file metadata with the receiver BEFORE the
+        // splitter starts streaming, so the receiver can prepare its output
+        // path and verify integrity after transfer.
+        let (file_input, file_label, file_total) = match self.mode {
+            Mode::File => {
+                let input_path = self.input.clone().ok_or_else(|| {
+                    Box::<dyn std::error::Error>::from(
+                        "file mode requires --input <PATH>",
+                    )
+                })?;
+                let file_sender = FileModeSender::new(input_path)
+                    .map_err(|e| format!("file mode setup failed: {e}"))?;
+                let meta = file_sender
+                    .prepare()
+                    .await
+                    .map_err(|e| format!("file metadata prepare failed: {e}"))?;
+                info!("file mode: sending {}", meta);
+                client
+                    .send_message(&ControlMessage::FileStart {
+                        filename: meta.filename.clone(),
+                        filesize: meta.filesize,
+                        file_crc32c: meta.file_crc32c,
+                    })
+                    .await
+                    .map_err(|e| format!("failed to send FileStart: {e}"))?;
+                let file = file_sender
+                    .open_async()
+                    .await
+                    .map_err(|e| format!("failed to open input file: {e}"))?;
+                let total = meta.filesize;
+                let label = meta.filename.clone();
+                (Some(file), Some(label), Some(total))
+            }
+            Mode::Pipe => (None, None, None),
+        };
 
         // ─── Step 4: Create UDP send workers ─────────────────────────────
         let mut worker_sockets = Vec::with_capacity(channels.len());
@@ -149,7 +224,16 @@ impl BraidSend {
         let (fragment_tx, fragment_rx) = mpsc::channel::<Vec<Vec<u8>>>(DEFAULT_CHANNEL_CAPACITY);
 
         // ─── Step 8: Create progress reporter ────────────────────────────
-        let mut progress = ProgressReporter::new(DEFAULT_PROGRESS_INTERVAL, self.verbosity);
+        let mut progress = if self.mode == Mode::File {
+            ProgressReporter::new_with_total(
+                DEFAULT_PROGRESS_INTERVAL,
+                self.verbosity,
+                file_label.clone(),
+                file_total,
+            )
+        } else {
+            ProgressReporter::new(DEFAULT_PROGRESS_INTERVAL, self.verbosity)
+        };
         queue_manager.set_progress_bytes(progress.bytes_tx());
 
         // ─── Step 9: Spawn pipeline tasks ────────────────────────────────
@@ -163,13 +247,23 @@ impl BraidSend {
             self.mtu,
         );
         let (splitter_pause_tx, splitter_pause_rx) = mpsc::channel::<bool>(16);
-        let splitter_handle = tokio::spawn(async move {
-            info!("chunk splitter started");
-            if let Err(e) = splitter.run(fragment_tx, Some(splitter_pause_rx), tokio::io::stdin()).await {
-                error!("chunk splitter error: {}", e);
-            }
-            info!("chunk splitter finished");
-        });
+        let splitter_handle = if let Some(file) = file_input {
+            tokio::spawn(async move {
+                info!("chunk splitter started (file input)");
+                if let Err(e) = splitter.run(fragment_tx, Some(splitter_pause_rx), file).await {
+                    error!("chunk splitter error: {}", e);
+                }
+                info!("chunk splitter finished");
+            })
+        } else {
+            tokio::spawn(async move {
+                info!("chunk splitter started (stdin)");
+                if let Err(e) = splitter.run(fragment_tx, Some(splitter_pause_rx), tokio::io::stdin()).await {
+                    error!("chunk splitter error: {}", e);
+                }
+                info!("chunk splitter finished");
+            })
+        };
 
         // Spawn QueueManager dispatch loop
         let qm_shutdown = shutdown.clone();
@@ -240,17 +334,32 @@ impl BraidSend {
         });
 
         // Spawn control message forwarding task (bidirectional: TCP ↔ SenderReactor)
+        // In file mode the task also forwards a single `FileComplete` to the
+        // wait logic via a oneshot channel, then exits so the run() loop
+        // can take over cleanup.
+        let (file_complete_tx, file_complete_rx) =
+            tokio::sync::oneshot::channel::<braid::protocol::ControlMessage>();
         let mut client = client;
         let control_recv_handle = tokio::spawn(async move {
+            let mut file_complete_tx = Some(file_complete_tx);
             loop {
                 tokio::select! {
                     result = client.recv_message() => {
                         match result {
                             Ok(msg) => {
-                                if matches!(msg, braid::protocol::ControlMessage::QueueStatus { .. }) {
-                                    let _ = queue_status_tx.send(msg).await;
-                                } else {
-                                    trace!("ignored non-QueueStatus control message: {msg:?}");
+                                match &msg {
+                                    braid::protocol::ControlMessage::QueueStatus { .. } => {
+                                        let _ = queue_status_tx.send(msg).await;
+                                    }
+                                    braid::protocol::ControlMessage::FileComplete { .. } => {
+                                        if let Some(tx) = file_complete_tx.take() {
+                                            let _ = tx.send(msg);
+                                        }
+                                        break;
+                                    }
+                                    _ => {
+                                        trace!("ignored non-QueueStatus control message: {msg:?}");
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -312,11 +421,60 @@ impl BraidSend {
             let _ = handle.await;
         }
 
-        if signal_received.load(Ordering::SeqCst) {
-            Err("shutdown initiated by signal".into())
+        // In file mode, wait for the receiver to acknowledge file completion
+        // and verify the transfer's integrity. The control forwarding task
+        // forwards a single FileComplete message via the oneshot channel.
+        let file_mode_result: Result<(), String> = if self.mode == Mode::File {
+            match tokio::time::timeout(Duration::from_secs(30), file_complete_rx).await {
+                Err(_) => {
+                    error!("receiver did not acknowledge file completion within 30s");
+                    Err("receiver did not acknowledge file completion".to_string())
+                }
+                Ok(Err(_)) => {
+                    error!("file complete channel closed before receiver acknowledged");
+                    Err("file complete channel closed unexpectedly".to_string())
+                }
+                Ok(Ok(braid::protocol::ControlMessage::FileComplete {
+                    success,
+                    expected_hash,
+                    computed_hash,
+                })) => {
+                    if success {
+                        info!(
+                            "file transfer verified: expected crc32c={:08x}, computed crc32c={:08x}",
+                            expected_hash, computed_hash
+                        );
+                        eprintln!(
+                            "file transfer verified (crc32c={:08x})",
+                            computed_hash
+                        );
+                        Ok(())
+                    } else {
+                        let msg = format!(
+                            "receiver reported file integrity failure: expected crc32c={:08x}, computed crc32c={:08x}",
+                            expected_hash, computed_hash
+                        );
+                        error!("{msg}");
+                        Err(msg)
+                    }
+                }
+                Ok(Ok(other)) => {
+                    let msg = format!(
+                        "unexpected control message while waiting for FileComplete: {other:?}"
+                    );
+                    error!("{msg}");
+                    Err(msg)
+                }
+            }
         } else {
             Ok(())
+        };
+
+        if signal_received.load(Ordering::SeqCst) {
+            return Err("shutdown initiated by signal".into());
         }
+
+        file_mode_result.map_err(|e| e.into())
     }
 }
 

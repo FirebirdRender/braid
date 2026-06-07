@@ -203,13 +203,15 @@ async fn main() {
                 ProgressVerbosity::Normal
             };
 
-            let sender = braid_send::BraidSend::new(
+            let sender = braid_send::BraidSend::new_with_mode(
                 args.destination,
                 args.chunk_size,
                 args.channels,
                 args.mtu,
                 args.max_rate,
                 verbosity,
+                args.mode,
+                args.input,
             );
 
             if let Err(e) = sender.run().await {
