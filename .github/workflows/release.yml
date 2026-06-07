@@ -8,14 +8,16 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-and-release:
+  quality:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -24,30 +26,16 @@ jobs:
           components: rustfmt, clippy
           cache: true
 
-      - name: Cache cargo artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-
-      - name: Verify version matches Cargo.toml
+      - name: Verify version matches tag
         run: |
           CARGO_VERSION=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
-          TAG_VERSION="${{ steps.version.outputs.version }}"
+          TAG_VERSION="${GITHUB_REF#refs/tags/}"
           TAG_VERSION_NO_V="${TAG_VERSION#v}"
           if [ "$CARGO_VERSION" != "$TAG_VERSION_NO_V" ]; then
-            echo "ERROR: Tag version $TAG_VERSION does not match Cargo.toml version $CARGO_VERSION"
+            echo "ERROR: Tag $TAG_VERSION does not match Cargo.toml $CARGO_VERSION"
             exit 1
           fi
-          echo "Version match confirmed: $TAG_VERSION == $CARGO_VERSION"
+          echo "Version match: $TAG_VERSION == $CARGO_VERSION"
 
       - name: Cargo check
         run: cargo check
@@ -61,35 +49,115 @@ jobs:
       - name: Cargo fmt
         run: cargo fmt --check
 
-      - name: Build release binaries
-        run: cargo build --release
+  build:
+    needs: quality
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - x86_64-unknown-freebsd
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: braid-x86_64-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: braid-aarch64-linux-gnu
+            deps: gcc-aarch64-linux-gnu
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            artifact_name: braid-armv7-linux-gnueabihf
+            deps: gcc-arm-linux-gnueabihf
+          - target: x86_64-unknown-freebsd
+            os: ubuntu-latest
+            artifact_name: braid-x86_64-freebsd
 
-      - name: Create release archives
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          cache: true
+
+      - name: Install cross-compilation deps
+        if: matrix.deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ${{ matrix.deps }}
+
+      - name: Install cargo-zigbuild (FreeBSD support via Zig)
+        if: matrix.target == 'x86_64-unknown-freebsd'
         run: |
+          pip install cargo-zigbuild 2>/dev/null || pip3 install cargo-zigbuild
+
+      - name: Build release binary
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-freebsd" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Create release archive
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
           mkdir -p release-artifacts
-          cp target/release/braid release-artifacts/
+          cp "target/${{ matrix.target }}/release/braid" "release-artifacts/${{ matrix.artifact_name }}"
+          cd release-artifacts
+          tar czf "${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}"
+          # Compute checksums
+          sha256sum "${{ matrix.artifact_name }}.tar.gz" > "${{ matrix.artifact_name }}.tar.gz.sha256"
+          ls -la
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release-artifacts/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts/
+
+      - name: Prepare release assets
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          mkdir -p final-assets
+          find release-artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} final-assets/ \;
+          ls -la final-assets/
 
       - name: Extract changelog for this version
         id: changelog
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${GITHUB_REF#refs/tags/}"
           VERSION_NO_V="${VERSION#v}"
-          # Extract the section for this version from CHANGELOG.md
-          awk "/^## \[$VERSION_NO_V\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md > release-notes.md
+          awk "/^## \\[$VERSION_NO_V\\]/{flag=1; next} /^## \\[/{flag=0} flag" CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then
-            echo "## $VERSION" > release-notes.md
-            echo "" >> release-notes.md
-            echo "No changelog entry found for this version." >> release-notes.md
+            echo "# $VERSION" > release-notes.md
           fi
+          cat release-notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: "Release ${{ steps.version.outputs.version }}"
+          tag_name: ${{ github.ref_name }}
+          name: "Release ${{ github.ref_name }}"
           body_path: release-notes.md
-          files: |
-            release-artifacts/braid
+          files: final-assets/*
           draft: false
           prerelease: false
-          generate_release_notes: false
