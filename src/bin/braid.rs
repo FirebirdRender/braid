@@ -64,7 +64,7 @@ struct ReceiveArgs {
     bind: SocketAddr,
 
     /// Maximum receive buffer size in bytes
-    #[arg(long, short = 's', value_parser = parse_byte_size)]
+    #[arg(long, short = 's', value_parser = parse_positive_byte_size)]
     buffer_size: usize,
 
     /// Path to output file (default: stdout)
@@ -122,6 +122,16 @@ fn parse_byte_size(value: &str) -> Result<usize, String> {
     parsed
         .checked_mul(multiplier)
         .ok_or_else(|| format!("invalid size: {value}"))
+}
+
+/// Parse a byte-size string with optional K/M/G suffix, rejecting zero.
+/// Examples: "64m" -> 64_000_000, "1" -> error (zero rejected)
+fn parse_positive_byte_size(value: &str) -> Result<usize, String> {
+    let parsed = parse_byte_size(value)?;
+    if parsed == 0 {
+        return Err(format!("value must be positive: {value}"));
+    }
+    Ok(parsed)
 }
 
 fn parse_data_rate(value: &str) -> Result<u64, String> {
