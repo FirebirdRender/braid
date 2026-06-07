@@ -47,6 +47,34 @@ fn sha256(data: &[u8]) -> String {
     hex.split_whitespace().next().unwrap_or("").to_string()
 }
 
+/// Wait for `path`'s size to be stable for 500ms, with a 60s timeout.
+/// Returns the final size. Robust to heavy load where data may not flush immediately.
+fn wait_for_file_stable<P: AsRef<std::path::Path>>(path: P) -> u64 {
+    let path = path.as_ref();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last_size: u64 = u64::MAX;
+    let mut stable_since: Option<std::time::Instant> = None;
+    loop {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if size == last_size {
+            if let Some(t) = stable_since {
+                if t.elapsed() >= Duration::from_millis(500) {
+                    return size;
+                }
+            } else {
+                stable_since = Some(std::time::Instant::now());
+            }
+        } else {
+            last_size = size;
+            stable_since = None;
+        }
+        if std::time::Instant::now() >= deadline {
+            return size;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 // ─── CLI Argument Parsing Tests ──────────────────────────────────────────────
 
 #[test]
@@ -702,8 +730,16 @@ fn test_concurrent_transfers_different_sizes() {
         String::from_utf8_lossy(&send2_status.stderr)
     );
 
-    // Give receivers time to process, then kill
-    std::thread::sleep(Duration::from_secs(3));
+    // Poll for receivers to finish writing (up to 60s each) instead of fixed sleep
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        let len1 = std::fs::metadata(&out1).map(|m| m.len()).unwrap_or(0);
+        let len2 = std::fs::metadata(&out2).map(|m| m.len()).unwrap_or(0);
+        if len1 >= data1.len() as u64 && len2 >= data2.len() as u64 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let _ = recv1_child.kill();
     let _ = recv2_child.kill();
     let _ = recv1_child.wait();
@@ -873,7 +909,7 @@ fn test_max_channels_loopback() {
         );
     }
 
-    std::thread::sleep(Duration::from_secs(3));
+    wait_for_file_stable(&output_path);
     let _ = recv_child.kill();
     let _ = recv_child.wait();
 

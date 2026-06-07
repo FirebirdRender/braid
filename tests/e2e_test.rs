@@ -66,6 +66,34 @@ fn sha256(data: &[u8]) -> String {
     hex.split_whitespace().next().unwrap_or("").to_string()
 }
 
+/// Wait for `path`'s size to be stable for 500ms, with a 60s timeout.
+/// Returns the final size. Robust to heavy load where data may not flush immediately.
+fn wait_for_file_stable<P: AsRef<std::path::Path>>(path: P) -> u64 {
+    let path = path.as_ref();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last_size: u64 = u64::MAX;
+    let mut stable_since: Option<std::time::Instant> = None;
+    loop {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if size == last_size {
+            if let Some(t) = stable_since {
+                if t.elapsed() >= Duration::from_millis(500) {
+                    return size;
+                }
+            } else {
+                stable_since = Some(std::time::Instant::now());
+            }
+        } else {
+            last_size = size;
+            stable_since = None;
+        }
+        if std::time::Instant::now() >= deadline {
+            return size;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Generate deterministic test data of the given size.
 fn test_data(size: usize) -> Vec<u8> {
     (0..size).map(|i| (i % 256) as u8).collect()
@@ -198,9 +226,7 @@ fn run_loopback(data: &[u8], control_port: u16, timeout_secs: u64) -> Vec<u8> {
         let _ = send_child.wait();
     }
 
-    // Give receiver time to process remaining data, then send SIGTERM
-    // for graceful shutdown (which flushes the BufWriter).
-    std::thread::sleep(Duration::from_secs(3));
+    wait_for_file_stable(&output_path);
     let _ = Command::new("kill")
         .args(["-TERM", &recv_child.id().to_string()])
         .status();
@@ -327,8 +353,7 @@ fn run_loopback_with_output(
         }
     }
 
-    // Give receiver time to flush, then send SIGTERM for graceful shutdown
-    std::thread::sleep(Duration::from_secs(3));
+    wait_for_file_stable(&output_path);
     let _ = Command::new("kill")
         .args(["-TERM", &recv_child.id().to_string()])
         .status();
