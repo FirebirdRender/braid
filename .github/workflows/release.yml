@@ -58,7 +58,6 @@ jobs:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
-          - x86_64-unknown-freebsd
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -67,13 +66,12 @@ jobs:
             os: ubuntu-latest
             artifact_name: braid-aarch64-linux-gnu
             deps: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-latest
             artifact_name: braid-armv7-linux-gnueabihf
             deps: gcc-arm-linux-gnueabihf
-          - target: x86_64-unknown-freebsd
-            os: ubuntu-latest
-            artifact_name: braid-x86_64-freebsd
+            linker: arm-linux-gnueabihf-gcc
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -92,18 +90,11 @@ jobs:
         if: matrix.deps
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ${{ matrix.deps }}
 
-      - name: Install cargo-zigbuild (FreeBSD support via Zig)
-        if: matrix.target == 'x86_64-unknown-freebsd'
-        run: |
-          pip install cargo-zigbuild 2>/dev/null || pip3 install cargo-zigbuild
-
       - name: Build release binary
-        run: |
-          if [ "${{ matrix.target }}" = "x86_64-unknown-freebsd" ]; then
-            cargo zigbuild --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
 
       - name: Create release archive
         run: |
