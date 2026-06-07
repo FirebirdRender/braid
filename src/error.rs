@@ -16,6 +16,13 @@ pub enum BraidError {
         /// Sequence number of the chunk that failed CRC verification.
         sequence_number: u64,
     },
+    /// File hash mismatch detected after receiving output data.
+    FileHashMismatch {
+        /// Expected CRC32C value for the file.
+        expected: u32,
+        /// Computed CRC32C value for the file.
+        computed: u32,
+    },
     /// Negotiation with the remote peer failed.
     NegotiationFailed(&'static str),
     /// All UDP channels failed — no path to the receiver remains.
@@ -35,6 +42,12 @@ impl fmt::Display for BraidError {
                 write!(
                     f,
                     "CRC mismatch at commit gate: sequence_number={sequence_number}"
+                )
+            }
+            Self::FileHashMismatch { expected, computed } => {
+                write!(
+                    f,
+                    "file CRC32C mismatch: expected 0x{expected:08X}, got 0x{computed:08X}"
                 )
             }
             Self::NegotiationFailed(msg) => write!(f, "negotiation failed: {msg}"),
@@ -130,8 +143,26 @@ mod tests {
         let err = BraidError::CrcMismatch { sequence_number: 0 };
         assert!(err.source().is_none());
 
+        let err = BraidError::FileHashMismatch {
+            expected: 0xDEADBEEF,
+            computed: 0xCAFEBABE,
+        };
+        assert!(err.source().is_none());
+
         let err = BraidError::Shutdown;
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn braid_error_file_hash_mismatch_display() {
+        let err = BraidError::FileHashMismatch {
+            expected: 0xDEADBEEF,
+            computed: 0xCAFEBABE,
+        };
+        assert_eq!(
+            err.to_string(),
+            "file CRC32C mismatch: expected 0xDEADBEEF, got 0xCAFEBABE"
+        );
     }
 
     #[test]

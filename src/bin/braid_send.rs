@@ -165,7 +165,7 @@ impl BraidSend {
         let (splitter_pause_tx, splitter_pause_rx) = mpsc::channel::<bool>(16);
         let splitter_handle = tokio::spawn(async move {
             info!("chunk splitter started");
-            if let Err(e) = splitter.run(fragment_tx, Some(splitter_pause_rx)).await {
+            if let Err(e) = splitter.run(fragment_tx, Some(splitter_pause_rx), tokio::io::stdin()).await {
                 error!("chunk splitter error: {}", e);
             }
             info!("chunk splitter finished");

@@ -91,23 +91,30 @@ impl ChunkSplitter {
         self.chunk_size
     }
 
-    /// Run the splitter: reads from stdin, produces fragments into the channel.
+    /// Run the splitter: reads from the given reader, produces fragments into the channel.
     ///
     /// This function is intended to be spawned as a background task. It reads
-    /// stdin until EOF, splitting data into chunks and fragments. On EOF it
-    /// flushes any remaining batch and returns. EOS is signaled by dropping
+    /// from `reader` until EOF, splitting data into chunks and fragments. On EOF
+    /// it flushes any remaining batch and returns. EOS is signaled by dropping
     /// the sender / channel close.
+    ///
+    /// # Type parameters
+    ///
+    /// * `R` — An async reader (e.g. `tokio::io::Stdin`, `tokio::fs::File`).
     ///
     /// # Errors
     ///
-    /// Returns an IO error if reading from stdin fails.
-    pub async fn run(
+    /// Returns an IO error if reading from the reader fails.
+    pub async fn run<R>(
         &self,
         tx: mpsc::Sender<Vec<Vec<u8>>>,
         pause_rx: Option<mpsc::Receiver<bool>>,
-    ) -> Result<(), std::io::Error> {
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
+        reader: R,
+    ) -> Result<(), std::io::Error>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let mut reader = BufReader::new(reader);
         // Pre-allocate read buffer and reuse it each iteration
         let mut read_buf = vec![0u8; self.chunk_size];
         // Pre-allocate chunk buffer and reuse it each iteration
@@ -532,7 +539,7 @@ mod tests {
         // Send pause signal BEFORE spawning so the splitter enters pause immediately
         pause_tx.send(true).await.unwrap();
 
-        let handle = tokio::spawn(async move { splitter.run(fragment_tx, Some(pause_rx)).await });
+        let handle = tokio::spawn(async move { splitter.run(fragment_tx, Some(pause_rx), tokio::io::stdin()).await });
 
         // Give the splitter time to enter the pause loop
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -546,5 +553,89 @@ mod tests {
             .expect("splitter should finish within timeout");
 
         assert!(result.is_ok(), "splitter should return Ok(())");
+    }
+
+    #[tokio::test]
+    async fn splitter_works_with_file_reader() {
+        let tmp_path = std::env::temp_dir().join("braid_splitter_test_file.bin");
+        let file_content: Vec<u8> = (0..200u8).collect();
+        std::fs::write(&tmp_path, &file_content).expect("write temp file");
+
+        let file = tokio::fs::File::open(&tmp_path)
+            .await
+            .expect("open temp file");
+
+        let splitter = ChunkSplitter::new(64, 1500);
+        let (tx, mut rx) = mpsc::channel::<Vec<Vec<u8>>>(64);
+
+        let handle = tokio::spawn(async move {
+            splitter.run(tx, None, file).await
+        });
+
+        let mut all_fragments: Vec<Vec<u8>> = Vec::new();
+        while let Some(batch) = rx.recv().await {
+            all_fragments.extend(batch);
+        }
+
+        handle.await.expect("splitter should complete").expect("splitter should return Ok(())");
+
+        assert!(!all_fragments.is_empty(), "should produce at least one fragment");
+
+        for frag in &all_fragments {
+            assert!(
+                frag.len() >= FragmentHeader::LEN,
+                "fragment too short: {} < {}",
+                frag.len(),
+                FragmentHeader::LEN
+            );
+            let header = FragmentHeader::try_from(&frag[..FragmentHeader::LEN])
+                .expect("valid fragment header");
+            assert!(
+                header.fragment_length as usize <= frag.len() - FragmentHeader::LEN,
+                "fragment_length exceeds available payload"
+            );
+            let payload = &frag[FragmentHeader::LEN..];
+            assert!(
+                verify_fragment_crc(payload, header.fragment_crc),
+                "fragment CRC mismatch"
+            );
+        }
+
+        let mut chunks: std::collections::BTreeMap<u32, Vec<(u16, Vec<u8>)>> =
+            std::collections::BTreeMap::new();
+        for frag in &all_fragments {
+            let header = FragmentHeader::try_from(&frag[..FragmentHeader::LEN]).unwrap();
+            let payload = frag[FragmentHeader::LEN..].to_vec();
+            chunks
+                .entry(header.chunk_id)
+                .or_default()
+                .push((header.fragment_index, payload));
+        }
+
+        let mut reassembled = Vec::new();
+        for (_chunk_id, mut fragments) in chunks {
+            fragments.sort_by_key(|(idx, _)| *idx);
+            let mut chunk_buf = Vec::new();
+            for (_, payload) in &fragments {
+                chunk_buf.extend_from_slice(payload);
+            }
+
+            assert!(
+                chunk_buf.len() >= ChunkHeader::LEN,
+                "chunk buffer too short for header"
+            );
+            let chunk_header =
+                ChunkHeader::try_from(&chunk_buf[..ChunkHeader::LEN]).unwrap();
+            let payload = &chunk_buf[ChunkHeader::LEN..];
+            assert!(
+                verify_chunk_crc(chunk_header.sequence_number, payload, chunk_header.chunk_crc),
+                "chunk CRC mismatch"
+            );
+            reassembled.extend_from_slice(payload);
+        }
+
+        assert_eq!(reassembled, file_content, "reassembled content must match original");
+
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }

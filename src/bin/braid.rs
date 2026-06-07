@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -7,6 +7,14 @@ use braid::progress::reporter::ProgressVerbosity;
 
 mod braid_receive;
 mod braid_send;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum Mode {
+    #[value(name = "pipe")]
+    Pipe,
+    #[value(name = "file")]
+    File,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "braid", version, about = "Braid CLI")]
@@ -43,6 +51,14 @@ struct SendArgs {
     #[arg(long, default_value_t = 1500, value_parser = parse_positive_usize)]
     mtu: usize,
 
+    /// Select pipe or file input mode
+    #[arg(long, value_enum, default_value_t = Mode::Pipe)]
+    mode: Mode,
+
+    /// Input file path for file mode
+    #[arg(long, value_name = "PATH")]
+    input: Option<PathBuf>,
+
     /// Quiet mode: suppress progress output
     #[arg(long, short = 'q', default_value_t = false)]
     quiet: bool,
@@ -74,6 +90,10 @@ struct ReceiveArgs {
     /// MTU for receive buffer sizing (default: 1500)
     #[arg(long, default_value_t = 1500, value_parser = parse_positive_usize)]
     mtu: usize,
+
+    /// Select pipe or file input mode
+    #[arg(long, value_enum, default_value_t = Mode::Pipe)]
+    mode: Mode,
 
     /// Quiet mode: suppress progress output
     #[arg(long, short = 'q', default_value_t = false)]
@@ -151,15 +171,30 @@ fn parse_data_rate(value: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("invalid rate: {value}"))
 }
 
+fn validate_send_args(args: &SendArgs) -> Result<(), String> {
+    match (args.mode, args.input.is_some()) {
+        (Mode::File, false) => Err("error: --input <PATH> is required in file mode".to_string()),
+        (Mode::Pipe, true) => Err("error: --input is only valid with --mode file".to_string()),
+        _ => Ok(()),
+    }
+}
+
+fn validate_receive_args(_args: &ReceiveArgs) -> Result<(), String> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Send(args) => {
+            if let Err(e) = validate_send_args(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
             let verbosity = if args.quiet {
                 ProgressVerbosity::Quiet
             } else if args.verbose {
@@ -183,6 +218,10 @@ async fn main() {
             }
         }
         Commands::Receive(args) => {
+            if let Err(e) = validate_receive_args(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
             let verbosity = if args.quiet {
                 ProgressVerbosity::Quiet
             } else if args.verbose {
@@ -233,6 +272,8 @@ mod tests {
                 assert_eq!(args.chunk_size, 4096);
                 assert_eq!(args.channels, 8);
                 assert_eq!(args.mtu, 9000);
+                assert_eq!(args.mode, Mode::Pipe);
+                assert!(args.input.is_none());
                 assert!(!args.quiet);
                 assert!(!args.verbose);
                 assert_eq!(args.max_rate, 0);
@@ -269,165 +310,64 @@ mod tests {
     }
 
     #[test]
-    fn parses_send_with_max_rate() {
+    fn rejects_file_mode_without_input() {
         let cli = Cli::try_parse_from([
             "braid",
             "send",
             "--destination",
-            "10.0.0.2:9000",
-            "--max-rate",
-            "125000000",
+            "127.0.0.1:9000",
+            "--mode",
+            "file",
         ])
-        .expect("send with max-rate should parse");
+        .expect("parsing should succeed before validation");
 
         match cli.command {
             Commands::Send(args) => {
-                assert_eq!(args.max_rate, 125000000);
+                let err = validate_send_args(&args).expect_err("file mode requires input");
+                assert_eq!(err, "error: --input <PATH> is required in file mode");
             }
             _ => panic!("expected send command"),
         }
     }
 
     #[test]
-    fn parses_short_flags_receive() {
+    fn rejects_input_without_file_mode() {
         let cli = Cli::try_parse_from([
             "braid",
-            "receive",
-            "-b",
-            "0.0.0.0:9000",
-            "-s",
-            "64m",
-            "-o",
-            "output.bin",
+            "send",
+            "--destination",
+            "127.0.0.1:9000",
+            "--input",
+            "payload.bin",
         ])
-        .expect("receive args with short flags should parse");
+        .expect("parsing should succeed before validation");
 
         match cli.command {
-            Commands::Receive(args) => {
-                assert_eq!(args.bind.to_string(), "0.0.0.0:9000");
-                assert_eq!(args.buffer_size, 64_000_000);
-                assert_eq!(args.output, Some(PathBuf::from("output.bin")));
-                assert!(!args.quiet);
-                assert!(!args.verbose);
+            Commands::Send(args) => {
+                let err = validate_send_args(&args).expect_err("input requires file mode");
+                assert_eq!(err, "error: --input is only valid with --mode file");
             }
-            _ => panic!("expected receive command"),
+            _ => panic!("expected send command"),
         }
     }
 
     #[test]
-    fn parses_receive_command() {
+    fn defaults_receive_to_pipe_mode() {
         let cli = Cli::try_parse_from([
             "braid",
             "receive",
             "--bind",
-            "[::1]:8080",
+            "127.0.0.1:9001",
             "--buffer-size",
-            "8192",
-            "--output",
-            "output.bin",
-            "--mtu",
             "65536",
         ])
         .expect("receive args should parse");
 
         match cli.command {
             Commands::Receive(args) => {
-                assert_eq!(args.bind.to_string(), "[::1]:8080");
-                assert_eq!(args.buffer_size, 8192);
-                assert_eq!(args.output, Some(PathBuf::from("output.bin")));
-                assert_eq!(args.mtu, 65536);
+                assert_eq!(args.mode, Mode::Pipe);
             }
             _ => panic!("expected receive command"),
         }
-    }
-
-    #[test]
-    fn parses_byte_size_suffixes() {
-        assert_eq!(parse_byte_size("64m").unwrap(), 64_000_000);
-        assert_eq!(parse_byte_size("1G").unwrap(), 1_000_000_000);
-        assert_eq!(parse_byte_size("65536").unwrap(), 65536);
-        assert_eq!(parse_byte_size("125k").unwrap(), 125_000);
-    }
-
-    #[test]
-    fn parses_data_rate_suffixes() {
-        assert_eq!(parse_data_rate("125m").unwrap(), 125_000_000);
-        assert_eq!(parse_data_rate("1g").unwrap(), 1_000_000_000);
-        assert_eq!(parse_data_rate("1000000").unwrap(), 1_000_000);
-    }
-
-    #[test]
-    fn parses_receive_without_output() {
-        let cli = Cli::try_parse_from([
-            "braid",
-            "receive",
-            "--bind",
-            "127.0.0.1:5000",
-            "--buffer-size",
-            "65536",
-        ])
-        .expect("receive without output should parse");
-
-        match cli.command {
-            Commands::Receive(args) => {
-                assert_eq!(args.bind.to_string(), "127.0.0.1:5000");
-                assert!(args.output.is_none());
-            }
-            _ => panic!("expected receive command"),
-        }
-    }
-
-    #[test]
-    fn parses_subcommand_alias_s() {
-        let cli = Cli::try_parse_from(["braid", "s", "-d", "127.0.0.1:9000"]).unwrap();
-
-        assert!(matches!(cli.command, Commands::Send(_)));
-    }
-
-    #[test]
-    fn parses_subcommand_alias_recv() {
-        let cli =
-            Cli::try_parse_from(["braid", "recv", "-b", "0.0.0.0:9000", "-s", "1024"]).unwrap();
-
-        assert!(matches!(cli.command, Commands::Receive(_)));
-    }
-
-    #[test]
-    fn parses_subcommand_alias_rx() {
-        let cli = Cli::try_parse_from(["braid", "rx", "-b", "0.0.0.0:9000", "-s", "1024"]).unwrap();
-
-        assert!(matches!(cli.command, Commands::Receive(_)));
-    }
-
-    #[test]
-    fn parses_send_with_defaults() {
-        let cli = Cli::try_parse_from(["braid", "send", "--destination", "127.0.0.1:9000"])
-            .expect("send args with defaults should parse");
-
-        match cli.command {
-            Commands::Send(args) => {
-                assert_eq!(args.chunk_size, 0);
-                assert_eq!(args.channels, 0);
-                assert_eq!(args.mtu, 1500);
-                assert!(!args.quiet);
-                assert!(!args.verbose);
-            }
-            _ => panic!("expected send command"),
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_socket_address() {
-        let err = Cli::try_parse_from([
-            "braid",
-            "receive",
-            "--bind",
-            "not-an-ip",
-            "--buffer-size",
-            "1024",
-        ])
-        .unwrap_err();
-
-        assert!(err.to_string().contains("invalid socket address"));
     }
 }

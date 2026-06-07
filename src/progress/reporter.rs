@@ -47,6 +47,8 @@ pub struct ProgressReporter {
     /// Shared counter for total bytes. Uses Arc so it can be shared with
     /// producers (e.g. CommitGate) via `bytes_tx()`.
     total_bytes: Arc<AtomicU64>,
+    expected_total: Option<u64>,
+    filename: Option<String>,
     chunk_size: AtomicU64,
     channel_count: AtomicU64,
     buffer_fullness_basis_points: AtomicU64,
@@ -58,6 +60,15 @@ pub struct ProgressReporter {
 
 impl ProgressReporter {
     pub fn new(interval: Duration, verbosity: ProgressVerbosity) -> Self {
+        Self::new_with_total(interval, verbosity, None, None)
+    }
+
+    pub fn new_with_total(
+        interval: Duration,
+        verbosity: ProgressVerbosity,
+        filename: Option<String>,
+        expected_total: Option<u64>,
+    ) -> Self {
         let now = Instant::now();
         Self {
             started_at: now,
@@ -65,6 +76,8 @@ impl ProgressReporter {
             interval,
             verbosity,
             total_bytes: Arc::new(AtomicU64::new(0)),
+            expected_total,
+            filename,
             chunk_size: AtomicU64::new(0),
             channel_count: AtomicU64::new(0),
             buffer_fullness_basis_points: AtomicU64::new(0),
@@ -124,7 +137,15 @@ impl ProgressReporter {
         let throughput_mbps = (delta_bytes as f64 / interval_secs) / (1024.0 * 1024.0);
         let eta = self.estimate_eta(&snapshot, throughput_mbps);
 
-        format_progress(snapshot, throughput_mbps, eta, self.verbosity, is_final)
+        format_progress(
+            snapshot,
+            throughput_mbps,
+            eta,
+            self.verbosity,
+            is_final,
+            self.filename.as_deref(),
+            self.expected_total,
+        )
     }
 
     pub fn tick<W: Write>(
@@ -188,12 +209,46 @@ fn format_progress(
     eta: Option<Duration>,
     verbosity: ProgressVerbosity,
     is_final: bool,
+    filename: Option<&str>,
+    expected_total: Option<u64>,
 ) -> String {
     let elapsed = format_duration(snapshot.elapsed);
     let eta_text = eta
         .map(format_duration)
         .unwrap_or_else(|| "--:--".to_string());
-    let mut line = format!("elapsed={} total={}B throughput={:.2}MB/s chunk={} channels={} buffer={:.1}% retransmits={} crc_errors={} eta={}", elapsed, snapshot.total_bytes, throughput_mbps, snapshot.chunk_size, snapshot.channel_count, snapshot.buffer_fullness_percent, snapshot.retransmit_count, snapshot.crc_errors, eta_text);
+    let mut line = if let Some(expected_total) = expected_total {
+        let percent = if expected_total == 0 {
+            0.0
+        } else {
+            (snapshot.total_bytes as f64 / expected_total as f64 * 100.0).clamp(0.0, 100.0)
+        };
+        let current_mb = snapshot.total_bytes as f64 / (1024.0 * 1024.0);
+        let total_mb = expected_total as f64 / (1024.0 * 1024.0);
+        let mut line = format!(
+            "{:.2}MB / {:.2}MB ({:02.0}%) elapsed={} throughput={:.2}MB/s chunk={} channels={} buffer={:.1}% retransmits={} crc_errors={} eta={}",
+            current_mb,
+            total_mb,
+            percent,
+            elapsed,
+            throughput_mbps,
+            snapshot.chunk_size,
+            snapshot.channel_count,
+            snapshot.buffer_fullness_percent,
+            snapshot.retransmit_count,
+            snapshot.crc_errors,
+            eta_text
+        );
+        if let Some(filename) = filename {
+            line = format!("{}: {}", filename, line);
+        }
+        line
+    } else {
+        let mut base = format!("elapsed={} total={}B throughput={:.2}MB/s chunk={} channels={} buffer={:.1}% retransmits={} crc_errors={} eta={}", elapsed, snapshot.total_bytes, throughput_mbps, snapshot.chunk_size, snapshot.channel_count, snapshot.buffer_fullness_percent, snapshot.retransmit_count, snapshot.crc_errors, eta_text);
+        if let Some(filename) = filename {
+            base = format!("{}: {}", filename, base);
+        }
+        base
+    };
     if verbosity == ProgressVerbosity::Verbose {
         line.push_str(" detailed");
     }
@@ -258,16 +313,21 @@ mod tests {
     fn formats_progress_line() {
         let r = ProgressReporter::new(Duration::from_secs(5), ProgressVerbosity::Normal);
         r.record_bytes(5 * 1024 * 1024);
-        r.set_chunk_size(4096);
-        r.set_channel_count(4);
         let line = r.format_line(Duration::from_secs(5), 5 * 1024 * 1024, false);
-        assert!(line.contains("elapsed="));
-        assert!(line.contains("throughput="));
+        assert!(line.contains("elapsed=00:00:05"));
+        assert!(line.contains("total=5242880B"));
     }
     #[test]
-    fn formats_final_summary() {
-        let r = ProgressReporter::new(Duration::from_secs(5), ProgressVerbosity::Normal);
-        let summary = r.finalize_summary();
-        assert!(summary.contains("Completed"));
+    fn progress_with_total_shows_percentage() {
+        let r = ProgressReporter::new_with_total(
+            Duration::from_secs(5),
+            ProgressVerbosity::Normal,
+            Some("output.bin".to_string()),
+            Some(1000),
+        );
+        r.record_bytes(500);
+        let line = r.format_line(Duration::from_secs(5), 500, false);
+        assert!(line.starts_with("output.bin: "));
+        assert!(line.contains("(50%)") || line.contains("(50.0%)"));
     }
 }

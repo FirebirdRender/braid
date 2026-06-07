@@ -2,6 +2,7 @@ pub mod adaptive;
 pub mod buffer;
 pub mod control;
 pub mod error;
+pub mod file_mode;
 pub mod flow;
 pub mod progress;
 pub mod protocol;

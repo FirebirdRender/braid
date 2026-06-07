@@ -16,6 +16,8 @@ pub enum ControlMessageKind {
     QueueStatus = 0x08,
     ChannelOpened = 0x09,
     ChannelClosed = 0x0A,
+    FileStart = 0x0B,
+    FileComplete = 0x0C,
     Error = 0xFF,
 }
 
@@ -34,6 +36,8 @@ impl TryFrom<u8> for ControlMessageKind {
             0x08 => Self::QueueStatus,
             0x09 => Self::ChannelOpened,
             0x0A => Self::ChannelClosed,
+            0x0B => Self::FileStart,
+            0x0C => Self::FileComplete,
             0xFF => Self::Error,
             _ => return Err("invalid control message kind"),
         })
@@ -80,6 +84,16 @@ pub enum ControlMessage {
         channel_id: u16,
         code: u16,
     },
+    FileStart {
+        filename: String,
+        filesize: u64,
+        file_crc32c: u32,
+    },
+    FileComplete {
+        success: bool,
+        expected_hash: u32,
+        computed_hash: u32,
+    },
     Error {
         code: u16,
         detail: u32,
@@ -99,6 +113,8 @@ impl ControlMessage {
             Self::QueueStatus { .. } => ControlMessageKind::QueueStatus,
             Self::ChannelOpened { .. } => ControlMessageKind::ChannelOpened,
             Self::ChannelClosed { .. } => ControlMessageKind::ChannelClosed,
+            Self::FileStart { .. } => ControlMessageKind::FileStart,
+            Self::FileComplete { .. } => ControlMessageKind::FileComplete,
             Self::Error { .. } => ControlMessageKind::Error,
         }
     }
@@ -157,6 +173,26 @@ impl ControlMessage {
                 buf.put_u16(*channel_id);
                 buf.put_u16(*code);
             }
+            Self::FileStart {
+                filename,
+                filesize,
+                file_crc32c,
+            } => {
+                let filename = filename.as_bytes();
+                buf.put_u16(filename.len() as u16);
+                buf.put_slice(filename);
+                buf.put_u64(*filesize);
+                buf.put_u32(*file_crc32c);
+            }
+            Self::FileComplete {
+                success,
+                expected_hash,
+                computed_hash,
+            } => {
+                buf.put_u8(u8::from(*success));
+                buf.put_u32(*expected_hash);
+                buf.put_u32(*computed_hash);
+            }
             Self::Error { code, detail } => {
                 buf.put_u16(*code);
                 buf.put_u32(*detail);
@@ -213,6 +249,21 @@ impl TryFrom<&[u8]> for ControlMessage {
             ControlMessageKind::ChannelClosed => Self::ChannelClosed {
                 channel_id: buf.get_u16(),
                 code: buf.get_u16(),
+            },
+            ControlMessageKind::FileStart => {
+                let filename_len = buf.get_u16() as usize;
+                let mut filename = vec![0; filename_len];
+                buf.copy_to_slice(&mut filename);
+                Self::FileStart {
+                    filename: String::from_utf8(filename).map_err(|_| "invalid utf-8 filename")?,
+                    filesize: buf.get_u64(),
+                    file_crc32c: buf.get_u32(),
+                }
+            }
+            ControlMessageKind::FileComplete => Self::FileComplete {
+                success: buf.get_u8() != 0,
+                expected_hash: buf.get_u32(),
+                computed_hash: buf.get_u32(),
             },
             ControlMessageKind::Error => Self::Error {
                 code: buf.get_u16(),
@@ -291,7 +342,84 @@ impl fmt::Display for ControlMessage {
                 "CHANNEL_CLOSED(channel_id={}, code={})",
                 channel_id, code
             ),
+            Self::FileStart {
+                filename,
+                filesize,
+                file_crc32c,
+            } => write!(
+                f,
+                "FILE_START(filename={}, filesize={}, file_crc32c={})",
+                filename, filesize, file_crc32c
+            ),
+            Self::FileComplete {
+                success,
+                expected_hash,
+                computed_hash,
+            } => write!(
+                f,
+                "FILE_COMPLETE(success={}, expected_hash={}, computed_hash={})",
+                success, expected_hash, computed_hash
+            ),
             Self::Error { code, detail } => write!(f, "ERROR(code={}, detail={})", code, detail),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_file_start_round_trip() {
+        let msg = ControlMessage::FileStart {
+            filename: "example.bin".to_string(),
+            filesize: 123456789,
+            file_crc32c: 0xDEADBEEF,
+        };
+        let bytes = msg.to_bytes();
+        let parsed = ControlMessage::try_from(bytes.as_slice()).unwrap();
+        assert_eq!(parsed, msg);
+        assert_eq!(msg.kind(), ControlMessageKind::FileStart);
+        assert_eq!(msg.to_string(), "FILE_START(filename=example.bin, filesize=123456789, file_crc32c=3735928559)");
+    }
+
+    #[test]
+    fn test_file_complete_round_trip() {
+        let msg = ControlMessage::FileComplete {
+            success: true,
+            expected_hash: 0x11112222,
+            computed_hash: 0x33334444,
+        };
+        let bytes = msg.to_bytes();
+        let parsed = ControlMessage::try_from(bytes.as_slice()).unwrap();
+        assert_eq!(parsed, msg);
+        assert_eq!(msg.kind(), ControlMessageKind::FileComplete);
+        assert_eq!(msg.to_string(), "FILE_COMPLETE(success=true, expected_hash=286335522, computed_hash=858997828)");
+    }
+
+    #[test]
+    fn test_file_start_long_filename() {
+        let filename = "a".repeat(65535);
+        let msg = ControlMessage::FileStart {
+            filename: filename.clone(),
+            filesize: u64::MAX,
+            file_crc32c: u32::MAX,
+        };
+        let bytes = msg.to_bytes();
+        assert_eq!(bytes.len(), 1 + 2 + 65535 + 8 + 4);
+        let parsed = ControlMessage::try_from(bytes.as_slice()).unwrap();
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_file_start_empty_filename() {
+        let msg = ControlMessage::FileStart {
+            filename: String::new(),
+            filesize: 0,
+            file_crc32c: 0,
+        };
+        let bytes = msg.to_bytes();
+        let parsed = ControlMessage::try_from(bytes.as_slice()).unwrap();
+        assert_eq!(parsed, msg);
     }
 }
