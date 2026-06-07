@@ -209,7 +209,6 @@ fn set_df_flag(socket: &Socket, _is_ipv4: bool) -> std::io::Result<()> {
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
-        target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "dragonfly",
@@ -221,7 +220,6 @@ fn set_df_flag(socket: &Socket, _is_ipv4: bool) -> std::io::Result<()> {
     #[cfg(not(any(
         target_os = "macos",
         target_os = "ios",
-        target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "dragonfly",
