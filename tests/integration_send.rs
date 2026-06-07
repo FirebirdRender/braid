@@ -148,11 +148,8 @@ async fn test_progress_reporter_creation() {
 async fn test_sender_reactor_creation() {
     use tokio::sync::mpsc;
     let (_control_tx, control_rx) = mpsc::channel(16);
-    let (_splitter_tx, _splitter_rx) = mpsc::channel(16);
-    let (_pause_tx, _pause_rx) = mpsc::channel(16);
-    let (_nack_tx, _nack_rx) = mpsc::channel(16);
 
-    let reactor = SenderReactor::new(100, control_rx, _splitter_tx, _pause_tx, _nack_tx);
+    let reactor = SenderReactor::new(100, control_rx);
     assert_eq!(
         reactor.controller().level(),
         braid::flow::FullnessLevel::Green
@@ -273,11 +270,8 @@ async fn test_flow_control_wiring() {
     use tokio::sync::mpsc;
 
     let (control_tx, control_rx) = mpsc::channel(16);
-    let (splitter_tx, mut splitter_rx) = mpsc::channel(16);
-    let (pause_tx, _pause_rx) = mpsc::channel(16);
-    let (nack_tx, _nack_rx) = mpsc::channel(16);
 
-    let mut reactor = SenderReactor::new(100, control_rx, splitter_tx, pause_tx, nack_tx);
+    let mut reactor = SenderReactor::new(100, control_rx);
 
     let handle = tokio::spawn(async move {
         reactor.run().await;
@@ -295,19 +289,9 @@ async fn test_flow_control_wiring() {
     // Give the reactor time to process
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Close the control channel to stop the reactor
     drop(control_tx);
 
-    handle.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Should have received a chunk size multiplier on the splitter channel
-    let multiplier = tokio::time::timeout(Duration::from_millis(100), splitter_rx.recv())
-        .await
-        .expect("should receive multiplier")
-        .expect("channel should be open");
-    assert!(
-        (multiplier - 0.75).abs() < f64::EPSILON,
-        "expected 0.75 multiplier for yellow zone, got {}",
-        multiplier
-    );
+    handle.await.unwrap();
 }

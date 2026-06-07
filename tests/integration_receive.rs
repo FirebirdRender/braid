@@ -129,7 +129,7 @@ async fn test_reassembly_to_orderer_pipeline() {
     fragment.extend_from_slice(&frag_header.to_bytes());
     fragment.extend_from_slice(&chunk_buf);
 
-    let completed = reassembler.add_fragment(fragment).unwrap();
+    let completed = reassembler.add_fragment(fragment).await.unwrap();
     assert!(
         completed,
         "single-fragment chunk should complete immediately"
@@ -218,7 +218,7 @@ async fn test_full_pipeline_reassembly_to_commit() {
         fragment.extend_from_slice(&frag_header.to_bytes());
         fragment.extend_from_slice(&chunk_buf);
 
-        let completed = reassembler.add_fragment(fragment).unwrap();
+    let completed = reassembler.add_fragment(fragment).await.unwrap();
         assert!(completed);
 
         let reassembled = reassembly_rx.recv().await.unwrap();

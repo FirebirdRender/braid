@@ -84,8 +84,10 @@ fn is_root() -> bool {
 /// RAII guard that removes the root qdisc on `lo` when dropped.
 ///
 /// This ensures cleanup even if the test panics.
+#[allow(dead_code)]
 struct TcGuard;
 
+#[allow(dead_code)]
 impl TcGuard {
     /// Install a netem qdisc on `lo` with the given parameters.
     fn install(loss: Option<f64>, reorder: Option<f64>, duplicate: Option<f64>) -> Self {
@@ -152,6 +154,7 @@ impl Drop for TcGuard {
 ///
 /// Returns the received data.  The caller must hold a `TcGuard` (or pass
 /// `None` for clean loopback).
+#[allow(dead_code)]
 fn run_loopback_with_tc(data: &[u8], _timeout_secs: u64, _tc: Option<&TcGuard>) {
     let output_path = format!("/tmp/braid_fault_{}.bin", std::process::id());
     let base_port = 28000 + (std::process::id() as u16 % 10000);

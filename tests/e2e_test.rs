@@ -568,9 +568,9 @@ fn test_multiple_sequential_transfers() {
 // This test verifies that the FragmentReassembler correctly detects CRC errors
 // by injecting a corrupted fragment and checking that it is rejected.
 
-#[test]
 #[serial]
-fn test_crc_integrity() {
+#[tokio::test]
+async fn test_crc_integrity() {
     use braid::protocol::crc::compute_fragment_crc;
     use braid::protocol::headers::{ChunkHeader, FragmentHeader};
     use bytes::BytesMut;
@@ -608,7 +608,7 @@ fn test_crc_integrity() {
         fragment.extend_from_slice(&fragment_header.to_bytes());
         fragment.extend_from_slice(fragment_payload);
 
-        let result = reassembler.add_fragment(fragment);
+        let result = reassembler.add_fragment(fragment).await;
         if fragment_index + 1 == total_fragments {
             assert_eq!(result.unwrap_err(), "chunk CRC mismatch");
         } else {
