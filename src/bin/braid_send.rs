@@ -152,9 +152,7 @@ impl BraidSend {
         let (file_input, file_label, file_total) = match self.mode {
             Mode::File => {
                 let input_path = self.input.clone().ok_or_else(|| {
-                    Box::<dyn std::error::Error>::from(
-                        "file mode requires --input <PATH>",
-                    )
+                    Box::<dyn std::error::Error>::from("file mode requires --input <PATH>")
                 })?;
                 let file_sender = FileModeSender::new(input_path)
                     .map_err(|e| format!("file mode setup failed: {e}"))?;
@@ -251,7 +249,10 @@ impl BraidSend {
         let splitter_handle = if let Some(file) = file_input {
             tokio::spawn(async move {
                 info!("chunk splitter started (file input)");
-                if let Err(e) = splitter.run(fragment_tx, Some(splitter_pause_rx), file).await {
+                if let Err(e) = splitter
+                    .run(fragment_tx, Some(splitter_pause_rx), file)
+                    .await
+                {
                     error!("chunk splitter error: {}", e);
                 }
                 info!("chunk splitter finished");
@@ -259,7 +260,10 @@ impl BraidSend {
         } else {
             tokio::spawn(async move {
                 info!("chunk splitter started (stdin)");
-                if let Err(e) = splitter.run(fragment_tx, Some(splitter_pause_rx), tokio::io::stdin()).await {
+                if let Err(e) = splitter
+                    .run(fragment_tx, Some(splitter_pause_rx), tokio::io::stdin())
+                    .await
+                {
                     error!("chunk splitter error: {}", e);
                 }
                 info!("chunk splitter finished");
@@ -393,22 +397,20 @@ impl BraidSend {
                     }
                 } else {
                     match client.recv_message().await {
-                        Ok(msg) => {
-                            match &msg {
-                                braid::protocol::ControlMessage::FileComplete { .. } => {
-                                    if let Some(tx) = file_complete_tx.take() {
-                                        let _ = tx.send(msg);
-                                    }
-                                    break;
+                        Ok(msg) => match &msg {
+                            braid::protocol::ControlMessage::FileComplete { .. } => {
+                                if let Some(tx) = file_complete_tx.take() {
+                                    let _ = tx.send(msg);
                                 }
-                                braid::protocol::ControlMessage::QueueStatus { .. } => {
-                                    let _ = queue_status_tx.send(msg).await;
-                                }
-                                _ => {
-                                    trace!("ignored control message in file-mode wait: {msg:?}");
-                                }
+                                break;
                             }
-                        }
+                            braid::protocol::ControlMessage::QueueStatus { .. } => {
+                                let _ = queue_status_tx.send(msg).await;
+                            }
+                            _ => {
+                                trace!("ignored control message in file-mode wait: {msg:?}");
+                            }
+                        },
                         Err(ControlError::Timeout) => {
                             trace!("control recv timeout while waiting for FileComplete, retrying");
                         }
@@ -482,10 +484,7 @@ impl BraidSend {
                             "file transfer verified: expected crc32c={:08x}, computed crc32c={:08x}",
                             expected_hash, computed_hash
                         );
-                        eprintln!(
-                            "file transfer verified (crc32c={:08x})",
-                            computed_hash
-                        );
+                        eprintln!("file transfer verified (crc32c={:08x})", computed_hash);
                         Ok(())
                     } else {
                         let msg = format!(

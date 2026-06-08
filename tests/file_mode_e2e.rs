@@ -77,7 +77,11 @@ fn wait_for_child(child: &mut Child, timeout_secs: u64) -> Option<Output> {
                     let _ = std::io::Read::read_to_end(err, &mut stderr);
                 }
                 let status = child.wait().ok()?;
-                return Some(Output { status, stdout, stderr });
+                return Some(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) => {
                 if Instant::now() > deadline {
@@ -112,23 +116,36 @@ fn port_offset() -> u16 {
 fn start_receiver(bin: &PathBuf, addr: &str, output_path: &std::path::Path) -> Child {
     Command::new(bin)
         .arg("receive")
-        .arg("--bind").arg(addr)
-        .arg("--buffer-size").arg("64m")
-        .arg("--mode").arg("file")
-        .arg("--output").arg(output_path)
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().expect("failed to spawn braid receive")
+        .arg("--bind")
+        .arg(addr)
+        .arg("--buffer-size")
+        .arg("64m")
+        .arg("--mode")
+        .arg("file")
+        .arg("--output")
+        .arg(output_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn braid receive")
 }
 
 fn start_sender(bin: &PathBuf, addr: &str, input_path: &std::path::Path) -> Child {
     Command::new(bin)
         .arg("send")
-        .arg("--destination").arg(addr)
-        .arg("--mode").arg("file")
-        .arg("--input").arg(input_path)
+        .arg("--destination")
+        .arg(addr)
+        .arg("--mode")
+        .arg("file")
+        .arg("--input")
+        .arg(input_path)
         .arg("--quiet")
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().expect("failed to spawn braid send")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn braid send")
 }
 
 /// Run a file mode transfer. After the output file is confirmed to exist
@@ -154,8 +171,12 @@ fn run_file_mode(
                 break;
             }
         }
-        if let Ok(Some(_)) = recv_child.try_wait() { break; }
-        if let Ok(Some(_)) = send_child.try_wait() { break; }
+        if let Ok(Some(_)) = recv_child.try_wait() {
+            break;
+        }
+        if let Ok(Some(_)) = send_child.try_wait() {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 
@@ -179,26 +200,43 @@ fn run_pipe_mode(data: &[u8], port: u16, timeout_secs: u64) -> Vec<u8> {
     let output_path = format!("/tmp/braid_pipe_e2e_{}_{}.bin", port, std::process::id());
 
     let mut recv_child = Command::new(&bin)
-        .arg("receive").arg("--bind").arg(&addr)
-        .arg("--buffer-size").arg("64m")
-        .arg("--output").arg(&output_path)
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().expect("failed to spawn pipe receiver");
+        .arg("receive")
+        .arg("--bind")
+        .arg(&addr)
+        .arg("--buffer-size")
+        .arg("64m")
+        .arg("--output")
+        .arg(&output_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn pipe receiver");
 
     std::thread::sleep(Duration::from_millis(500));
 
     let mut send_child = Command::new(&bin)
-        .arg("send").arg("--destination").arg(&addr).arg("--quiet")
-        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().expect("failed to spawn pipe sender");
+        .arg("send")
+        .arg("--destination")
+        .arg(&addr)
+        .arg("--quiet")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn pipe sender");
 
     if let Some(mut stdin) = send_child.stdin.take() {
-        stdin.write_all(data).expect("failed to write to send stdin");
+        stdin
+            .write_all(data)
+            .expect("failed to write to send stdin");
         drop(stdin);
     }
 
     let _send_result = wait_for_child(&mut send_child, timeout_secs);
-    let _ = Command::new("kill").args(["-KILL", &recv_child.id().to_string()]).status();
+    let _ = Command::new("kill")
+        .args(["-KILL", &recv_child.id().to_string()])
+        .status();
     let _ = recv_child.wait();
 
     let received = std::fs::read(&output_path).unwrap_or_default();
@@ -295,18 +333,34 @@ fn test_file_mode_sanitizes_path_traversal() {
     let addr = format!("127.0.0.1:{}", port);
 
     let mut recv_cmd = Command::new(&bin);
-    recv_cmd.arg("receive").arg("--bind").arg(&addr)
-        .arg("--buffer-size").arg("64m")
-        .arg("--mode").arg("file")
+    recv_cmd
+        .arg("receive")
+        .arg("--bind")
+        .arg(&addr)
+        .arg("--buffer-size")
+        .arg("64m")
+        .arg("--mode")
+        .arg("file")
         .current_dir(dir.path())
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut recv_child = recv_cmd.spawn().expect("failed to spawn receiver");
     std::thread::sleep(Duration::from_millis(500));
 
     let mut send_cmd = Command::new(&bin);
-    send_cmd.arg("send").arg("--destination").arg(&addr)
-        .arg("--mode").arg("file").arg("--input").arg(&input_path).arg("--quiet")
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    send_cmd
+        .arg("send")
+        .arg("--destination")
+        .arg(&addr)
+        .arg("--mode")
+        .arg("file")
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--quiet")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut send_child = send_cmd.spawn().expect("failed to spawn sender");
 
     // Wait for receiver to produce output
@@ -315,7 +369,10 @@ fn test_file_mode_sanitizes_path_traversal() {
     kill_process(&mut send_child);
 
     let expected_output = dir.path().join("passwd");
-    assert!(expected_output.exists(), "output file should be named after the basename (passwd)");
+    assert!(
+        expected_output.exists(),
+        "output file should be named after the basename (passwd)"
+    );
     let received_data = std::fs::read(&expected_output).unwrap_or_default();
     assert_eq!(received_data, data, "content should match input");
 }
@@ -335,18 +392,34 @@ fn test_file_mode_filename_default() {
     let addr = format!("127.0.0.1:{}", port);
 
     let mut recv_cmd = Command::new(&bin);
-    recv_cmd.arg("receive").arg("--bind").arg(&addr)
-        .arg("--buffer-size").arg("64m")
-        .arg("--mode").arg("file")
+    recv_cmd
+        .arg("receive")
+        .arg("--bind")
+        .arg(&addr)
+        .arg("--buffer-size")
+        .arg("64m")
+        .arg("--mode")
+        .arg("file")
         .current_dir(dir.path())
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut recv_child = recv_cmd.spawn().expect("failed to spawn receiver");
     std::thread::sleep(Duration::from_millis(500));
 
     let mut send_cmd = Command::new(&bin);
-    send_cmd.arg("send").arg("--destination").arg(&addr)
-        .arg("--mode").arg("file").arg("--input").arg(&input_path).arg("--quiet")
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    send_cmd
+        .arg("send")
+        .arg("--destination")
+        .arg(&addr)
+        .arg("--mode")
+        .arg("file")
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--quiet")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut send_child = send_cmd.spawn().expect("failed to spawn sender");
 
     std::thread::sleep(Duration::from_secs(15));
@@ -354,7 +427,10 @@ fn test_file_mode_filename_default() {
     kill_process(&mut send_child);
 
     let expected_output = dir.path().join("my_custom_file.bin");
-    assert!(expected_output.exists(), "output file should be named after the input basename");
+    assert!(
+        expected_output.exists(),
+        "output file should be named after the input basename"
+    );
     let actual_crc = file_crc32c(&expected_output);
     assert_eq!(actual_crc, expected_crc, "CRC32C mismatch");
 }
@@ -376,7 +452,10 @@ fn test_file_mode_output_override() {
     assert!(send_result.is_some(), "sender timed out");
     assert!(recv_result.is_some(), "receiver timed out");
 
-    assert!(output_path.exists(), "output file should exist at override path");
+    assert!(
+        output_path.exists(),
+        "output file should exist at override path"
+    );
     let actual_crc = file_crc32c(&output_path);
     assert_eq!(actual_crc, expected_crc, "CRC32C mismatch");
 }
@@ -413,7 +492,9 @@ fn test_file_mode_hash_mismatch_deletes_output() {
     std::thread::sleep(Duration::from_millis(800));
 
     // Overwrite file with different content
-    let modified_data: Vec<u8> = (0..(500 * 1024 * 1024)).map(|i| (255 - (i % 256)) as u8).collect();
+    let modified_data: Vec<u8> = (0..(500 * 1024 * 1024))
+        .map(|i| (255 - (i % 256)) as u8)
+        .collect();
     std::fs::write(&input_path, &modified_data).expect("failed to overwrite input");
 
     let recv_result = wait_for_child(&mut recv_child, 120);
@@ -428,14 +509,18 @@ fn test_file_mode_hash_mismatch_deletes_output() {
     // At least one of them should report failure
     let recv_failed = !recv_output.status.success();
     let send_failed = !send_output.status.success();
-    assert!(recv_failed || send_failed,
+    assert!(
+        recv_failed || send_failed,
         "at least one side should fail (hash mismatch): receiver={} sender={}",
         recv_output.status.code().unwrap_or(-1),
-        send_output.status.code().unwrap_or(-1));
+        send_output.status.code().unwrap_or(-1)
+    );
 
     // Output file should be deleted by receiver on mismatch
-    assert!(!output_path.exists(),
-        "output file should have been deleted after hash mismatch");
+    assert!(
+        !output_path.exists(),
+        "output file should have been deleted after hash mismatch"
+    );
 }
 
 #[test]
@@ -453,26 +538,45 @@ fn test_file_mode_timeout_on_file_complete() {
 
     // Start receiver with null stderr
     let mut recv_cmd = Command::new(&bin);
-    recv_cmd.arg("receive").arg("--bind").arg(&addr)
-        .arg("--buffer-size").arg("64m")
-        .arg("--mode").arg("file")
-        .arg("--output").arg(&output_path)
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    recv_cmd
+        .arg("receive")
+        .arg("--bind")
+        .arg(&addr)
+        .arg("--buffer-size")
+        .arg("64m")
+        .arg("--mode")
+        .arg("file")
+        .arg("--output")
+        .arg(&output_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut recv_child = recv_cmd.spawn().expect("failed to spawn receiver");
     std::thread::sleep(Duration::from_millis(500));
 
     // Start sender WITH piped stderr so we can see completion errors
     let mut send_cmd = Command::new(&bin);
-    send_cmd.arg("send").arg("--destination").arg(&addr)
-        .arg("--mode").arg("file").arg("--input").arg(&input_path).arg("--quiet")
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    send_cmd
+        .arg("send")
+        .arg("--destination")
+        .arg(&addr)
+        .arg("--mode")
+        .arg("file")
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--quiet")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     let mut send_child = send_cmd.spawn().expect("failed to spawn sender");
 
     // Wait for data transfer
     std::thread::sleep(Duration::from_secs(5));
 
     // Force-kill receiver before it sends FileComplete
-    let _ = Command::new("kill").args(["-KILL", &recv_child.id().to_string()]).status();
+    let _ = Command::new("kill")
+        .args(["-KILL", &recv_child.id().to_string()])
+        .status();
     let _ = recv_child.wait();
 
     // Sender should exit with error waiting for FileComplete
@@ -505,7 +609,8 @@ fn test_file_mode_overwrite_renames() {
     let expected_crc = crc32c_of(&data);
 
     // Pre-create output to trigger auto-rename
-    std::fs::write(&output_path, b"pre-existing content").expect("failed to create pre-existing output");
+    std::fs::write(&output_path, b"pre-existing content")
+        .expect("failed to create pre-existing output");
 
     let bin = braid_binary();
     let addr = format!("127.0.0.1:{}", port);
@@ -521,7 +626,9 @@ fn test_file_mode_overwrite_renames() {
         if renamed_path.exists() {
             break;
         }
-        if let Ok(Some(_)) = recv_child.try_wait() { break; }
+        if let Ok(Some(_)) = recv_child.try_wait() {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 
@@ -529,12 +636,22 @@ fn test_file_mode_overwrite_renames() {
     kill_process(&mut send_child);
 
     // Original file unchanged
-    assert!(output_path.exists(), "original output file should still exist");
+    assert!(
+        output_path.exists(),
+        "original output file should still exist"
+    );
     let original_content = std::fs::read(&output_path).unwrap_or_default();
-    assert_eq!(String::from_utf8_lossy(&original_content), "pre-existing content");
+    assert_eq!(
+        String::from_utf8_lossy(&original_content),
+        "pre-existing content"
+    );
 
     // Renamed output exists with correct data
-    assert!(renamed_path.exists(), "auto-renamed output should exist: {:?}", renamed_path);
+    assert!(
+        renamed_path.exists(),
+        "auto-renamed output should exist: {:?}",
+        renamed_path
+    );
     let actual_crc = file_crc32c(&renamed_path);
     assert_eq!(actual_crc, expected_crc, "CRC32C mismatch");
 }
@@ -601,27 +718,44 @@ fn test_file_mode_full_pipeline_100mb() {
 fn test_cli_missing_input() {
     let bin = braid_binary();
     let output = Command::new(&bin)
-        .arg("send").arg("--destination").arg("127.0.0.1:19012")
-        .arg("--mode").arg("file")
-        .stdout(Stdio::null()).stderr(Stdio::piped())
-        .output().expect("failed to run braid send");
+        .arg("send")
+        .arg("--destination")
+        .arg("127.0.0.1:19012")
+        .arg("--mode")
+        .arg("file")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run braid send");
     assert!(!output.status.success(), "should exit 1");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--input"), "stderr should mention --input, got: {}", stderr);
+    assert!(
+        stderr.contains("--input"),
+        "stderr should mention --input, got: {}",
+        stderr
+    );
 }
 
 #[test]
 fn test_cli_input_without_mode() {
     let bin = braid_binary();
     let output = Command::new(&bin)
-        .arg("send").arg("--destination").arg("127.0.0.1:19013")
-        .arg("--input").arg("test.bin")
-        .stdout(Stdio::null()).stderr(Stdio::piped())
-        .output().expect("failed to run braid send");
+        .arg("send")
+        .arg("--destination")
+        .arg("127.0.0.1:19013")
+        .arg("--input")
+        .arg("test.bin")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run braid send");
     assert!(!output.status.success(), "should exit 1");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--input") || stderr.contains("--mode"),
-        "stderr should mention --input/--mode, got: {}", stderr);
+    assert!(
+        stderr.contains("--input") || stderr.contains("--mode"),
+        "stderr should mention --input/--mode, got: {}",
+        stderr
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -660,16 +794,33 @@ fn test_file_mode_receiver_rejects_file_start_in_pipe_mode() {
     let addr = format!("127.0.0.1:{}", port);
 
     let mut recv_cmd = Command::new(&bin);
-    recv_cmd.arg("receive").arg("--bind").arg(&addr)
-        .arg("--buffer-size").arg("64m")
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-    let mut recv_child = recv_cmd.spawn().expect("failed to spawn pipe mode receiver");
+    recv_cmd
+        .arg("receive")
+        .arg("--bind")
+        .arg(&addr)
+        .arg("--buffer-size")
+        .arg("64m")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut recv_child = recv_cmd
+        .spawn()
+        .expect("failed to spawn pipe mode receiver");
     std::thread::sleep(Duration::from_millis(500));
 
     let mut send_cmd = Command::new(&bin);
-    send_cmd.arg("send").arg("--destination").arg(&addr)
-        .arg("--mode").arg("file").arg("--input").arg(&input_path).arg("--quiet")
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    send_cmd
+        .arg("send")
+        .arg("--destination")
+        .arg(&addr)
+        .arg("--mode")
+        .arg("file")
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--quiet")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut send_child = send_cmd.spawn().expect("failed to spawn file mode sender");
 
     // Receiver should exit 1 on FileStart in pipe mode

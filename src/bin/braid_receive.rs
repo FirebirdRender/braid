@@ -145,9 +145,7 @@ impl BraidReceive {
                     FileMetadata::from_basename(sanitized, filesize, file_crc32c)
                 }
                 _ => {
-                    return Err(
-                        format!("expected FileStart in file mode, got {msg:?}").into(),
-                    );
+                    return Err(format!("expected FileStart in file mode, got {msg:?}").into());
                 }
             };
             info!("file mode: receiving {}", fs);
@@ -157,7 +155,10 @@ impl BraidReceive {
                 .await
                 .map_err(|e| format!("failed to resolve output path: {e}"))?;
             info!("writing output to file: {}", output_path.display());
-            (Some((receiver_obj, output_path, fs.file_crc32c)), Some(conn))
+            (
+                Some((receiver_obj, output_path, fs.file_crc32c)),
+                Some(conn),
+            )
         } else {
             (None, Some(conn))
         };
@@ -348,7 +349,9 @@ impl BraidReceive {
         let _control_forward_handle = if self.mode == Mode::File {
             None
         } else {
-            let mut c = conn_opt.take().expect("conn should be present in pipe mode");
+            let mut c = conn_opt
+                .take()
+                .expect("conn should be present in pipe mode");
             Some(tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -462,7 +465,9 @@ impl BraidReceive {
 
         // ─── File mode: post-EOS hash validation + FileComplete ──────────
         if let Some((ref receiver_obj, ref output_path, expected_hash)) = file_mode_state {
-            let mut conn = conn_opt.take().expect("conn should be available in file mode");
+            let mut conn = conn_opt
+                .take()
+                .expect("conn should be available in file mode");
 
             // Check if CommitGate encountered write errors during data transfer.
             // If a write error occurred (e.g. disk full), we report failure without
@@ -514,17 +519,15 @@ impl BraidReceive {
                     warn!("failed to delete output file after hash mismatch: {e}");
                 }
             } else {
-                info!(
-                    "file transferred successfully: crc32c=0x{:08X}",
-                    computed
-                );
-                eprintln!(
-                    "file transferred successfully (crc32c=0x{:08X})",
-                    computed
-                );
+                info!("file transferred successfully: crc32c=0x{:08X}", computed);
+                eprintln!("file transferred successfully (crc32c=0x{:08X})", computed);
             }
             shutdown.initiate();
-            let result = if success { Ok(()) } else { Err("file hash mismatch".into()) };
+            let result = if success {
+                Ok(())
+            } else {
+                Err("file hash mismatch".into())
+            };
             let _ = monitor_cancel_tx.try_send(());
             let _ = monitor_handle.await;
             let _ = progress_handle.await;

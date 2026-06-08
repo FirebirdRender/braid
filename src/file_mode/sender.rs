@@ -28,9 +28,7 @@ impl FileModeSender {
         let metadata = std::fs::metadata(&input_path)?;
 
         if !metadata.is_file() {
-            return Err(BraidError::Protocol(
-                "input path is not a regular file",
-            ));
+            return Err(BraidError::Protocol("input path is not a regular file"));
         }
 
         Ok(Self { input_path })
@@ -114,9 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_nonexistent_file_errors() {
-        let path = PathBuf::from(
-            "/nonexistent-file-for-braid-prepare-test-abc123",
-        );
+        let path = PathBuf::from("/nonexistent-file-for-braid-prepare-test-abc123");
         let result = FileModeSender::new(path);
         assert!(result.is_err());
     }

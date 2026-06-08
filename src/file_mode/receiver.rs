@@ -38,15 +38,12 @@ impl FileModeReceiver {
     ///
     /// Both paths go through `output::resolve_output_path` to prevent
     /// accidental overwrites.
-    pub async fn resolve_output_path(
-        &self,
-        metadata: &FileMetadata,
-    ) -> Result<PathBuf> {
+    pub async fn resolve_output_path(&self, metadata: &FileMetadata) -> Result<PathBuf> {
         let desired = if let Some(ref override_path) = self.output_override {
             override_path.clone()
         } else {
-            let sanitized = sanitize::sanitize_filename(&metadata.filename)
-                .map_err(BraidError::Protocol)?;
+            let sanitized =
+                sanitize::sanitize_filename(&metadata.filename).map_err(BraidError::Protocol)?;
             PathBuf::from(sanitized)
         };
 

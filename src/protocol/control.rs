@@ -380,7 +380,10 @@ mod tests {
         let parsed = ControlMessage::try_from(bytes.as_slice()).unwrap();
         assert_eq!(parsed, msg);
         assert_eq!(msg.kind(), ControlMessageKind::FileStart);
-        assert_eq!(msg.to_string(), "FILE_START(filename=example.bin, filesize=123456789, file_crc32c=3735928559)");
+        assert_eq!(
+            msg.to_string(),
+            "FILE_START(filename=example.bin, filesize=123456789, file_crc32c=3735928559)"
+        );
     }
 
     #[test]
@@ -394,7 +397,10 @@ mod tests {
         let parsed = ControlMessage::try_from(bytes.as_slice()).unwrap();
         assert_eq!(parsed, msg);
         assert_eq!(msg.kind(), ControlMessageKind::FileComplete);
-        assert_eq!(msg.to_string(), "FILE_COMPLETE(success=true, expected_hash=286335522, computed_hash=858997828)");
+        assert_eq!(
+            msg.to_string(),
+            "FILE_COMPLETE(success=true, expected_hash=286335522, computed_hash=858997828)"
+        );
     }
 
     #[test]

@@ -296,8 +296,7 @@ mod tests {
         chunk_buf.extend_from_slice(&chunk_header.to_bytes());
         chunk_buf.extend_from_slice(payload);
 
-        let total_fragments =
-            chunk_buf.len().div_ceil(s.fragment_payload_size);
+        let total_fragments = chunk_buf.len().div_ceil(s.fragment_payload_size);
         assert_eq!(total_fragments, 1);
 
         // Build the fragment
@@ -539,7 +538,11 @@ mod tests {
         // Send pause signal BEFORE spawning so the splitter enters pause immediately
         pause_tx.send(true).await.unwrap();
 
-        let handle = tokio::spawn(async move { splitter.run(fragment_tx, Some(pause_rx), tokio::io::stdin()).await });
+        let handle = tokio::spawn(async move {
+            splitter
+                .run(fragment_tx, Some(pause_rx), tokio::io::stdin())
+                .await
+        });
 
         // Give the splitter time to enter the pause loop
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -568,18 +571,22 @@ mod tests {
         let splitter = ChunkSplitter::new(64, 1500);
         let (tx, mut rx) = mpsc::channel::<Vec<Vec<u8>>>(64);
 
-        let handle = tokio::spawn(async move {
-            splitter.run(tx, None, file).await
-        });
+        let handle = tokio::spawn(async move { splitter.run(tx, None, file).await });
 
         let mut all_fragments: Vec<Vec<u8>> = Vec::new();
         while let Some(batch) = rx.recv().await {
             all_fragments.extend(batch);
         }
 
-        handle.await.expect("splitter should complete").expect("splitter should return Ok(())");
+        handle
+            .await
+            .expect("splitter should complete")
+            .expect("splitter should return Ok(())");
 
-        assert!(!all_fragments.is_empty(), "should produce at least one fragment");
+        assert!(
+            !all_fragments.is_empty(),
+            "should produce at least one fragment"
+        );
 
         for frag in &all_fragments {
             assert!(
@@ -624,17 +631,23 @@ mod tests {
                 chunk_buf.len() >= ChunkHeader::LEN,
                 "chunk buffer too short for header"
             );
-            let chunk_header =
-                ChunkHeader::try_from(&chunk_buf[..ChunkHeader::LEN]).unwrap();
+            let chunk_header = ChunkHeader::try_from(&chunk_buf[..ChunkHeader::LEN]).unwrap();
             let payload = &chunk_buf[ChunkHeader::LEN..];
             assert!(
-                verify_chunk_crc(chunk_header.sequence_number, payload, chunk_header.chunk_crc),
+                verify_chunk_crc(
+                    chunk_header.sequence_number,
+                    payload,
+                    chunk_header.chunk_crc
+                ),
                 "chunk CRC mismatch"
             );
             reassembled.extend_from_slice(payload);
         }
 
-        assert_eq!(reassembled, file_content, "reassembled content must match original");
+        assert_eq!(
+            reassembled, file_content,
+            "reassembled content must match original"
+        );
 
         let _ = std::fs::remove_file(&tmp_path);
     }

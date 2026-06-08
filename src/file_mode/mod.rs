@@ -27,7 +27,11 @@ impl FileMetadata {
 
 impl fmt::Display for FileMetadata {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({} bytes, crc32c={:08x})", self.filename, self.filesize, self.file_crc32c)
+        write!(
+            f,
+            "{} ({} bytes, crc32c={:08x})",
+            self.filename, self.filesize, self.file_crc32c
+        )
     }
 }
 

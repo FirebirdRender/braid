@@ -35,17 +35,26 @@ mod tests {
 
     #[test]
     fn sanitize_rejects_path_traversal() {
-        assert_eq!(sanitize_filename("../../../etc/passwd"), Err("invalid filename"));
+        assert_eq!(
+            sanitize_filename("../../../etc/passwd"),
+            Err("invalid filename")
+        );
     }
 
     #[test]
     fn sanitize_rejects_absolute_path() {
-        assert_eq!(sanitize_filename("/etc/passwd"), Err("path separator not allowed"));
+        assert_eq!(
+            sanitize_filename("/etc/passwd"),
+            Err("path separator not allowed")
+        );
     }
 
     #[test]
     fn sanitize_rejects_null_byte() {
-        assert_eq!(sanitize_filename("file\0.bin"), Err("null byte not allowed"));
+        assert_eq!(
+            sanitize_filename("file\0.bin"),
+            Err("null byte not allowed")
+        );
     }
 
     #[test]

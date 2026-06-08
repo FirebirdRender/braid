@@ -364,8 +364,7 @@ mod tests {
         let chunk_header = ChunkHeader::new(0, chunk_data.len() as u16, chunk_id as u64, chunk_crc);
 
         let chunk_buf_len = ChunkHeader::LEN + chunk_data.len();
-        let total_fragments =
-            chunk_buf_len.div_ceil(fragment_payload_size) as u16;
+        let total_fragments = chunk_buf_len.div_ceil(fragment_payload_size) as u16;
 
         (0..total_fragments)
             .map(|fi| {
@@ -516,8 +515,7 @@ mod tests {
         chunk_buf.extend_from_slice(&chunk_header.to_bytes());
         chunk_buf.extend_from_slice(chunk_data);
 
-        let total_fragments =
-            chunk_buf.len().div_ceil(fragment_payload_size) as u16;
+        let total_fragments = chunk_buf.len().div_ceil(fragment_payload_size) as u16;
 
         let fragments: Vec<Vec<u8>> = (0..total_fragments)
             .map(|fi| {
