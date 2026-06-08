@@ -58,6 +58,7 @@ jobs:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
+          - x86_64-unknown-freebsd
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -72,6 +73,10 @@ jobs:
             artifact_name: braid-armv7-linux-gnueabihf
             deps: gcc-arm-linux-gnueabihf
             linker: arm-linux-gnueabihf-gcc
+          - target: x86_64-unknown-freebsd
+            os: ubuntu-latest
+            artifact_name: braid-x86_64-freebsd
+            use_cross: true
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -90,11 +95,22 @@ jobs:
         if: matrix.deps
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ${{ matrix.deps }}
 
+      - name: Install cross for FreeBSD builds
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
       - name: Build release binary
+        if: "!matrix.use_cross"
         run: cargo build --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+
+      - name: Build release binary (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Create release archive
         run: |
