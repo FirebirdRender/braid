@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn braid_error_io_display() {
-        let err = BraidError::Io(std::io::Error::new(std::io::ErrorKind::Other, "disk full"));
+        let err = BraidError::Io(std::io::Error::other("disk full"));
         let msg = err.to_string();
         assert!(msg.contains("I/O error"));
         assert!(msg.contains("disk full"));
@@ -173,6 +173,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unnecessary_literal_unwrap)]
     fn result_alias_works() {
         let ok: Result<i32> = Ok(42);
         assert_eq!(ok.unwrap(), 42);

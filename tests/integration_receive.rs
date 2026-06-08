@@ -3,6 +3,7 @@ use std::time::Duration;
 use braid::buffer::pool::BufferPool;
 use braid::flow::ReceiverMonitor;
 use braid::progress::reporter::{ProgressReporter, ProgressVerbosity};
+use braid::protocol::ControlMessage;
 use braid::receiver::commit::{CommitGate, CommitGateInput};
 use braid::receiver::ordering::ChunkOrderer;
 use braid::receiver::reassembly::FragmentReassembler;
@@ -311,4 +312,53 @@ async fn test_shutdown_propagation_to_components() {
         .expect("poll task should complete")
         .unwrap();
     assert!(poll_result);
+}
+
+// ─── Error path tests ────────────────────────────────────────────────
+
+/// Test: stats_arc().snapshot() correctly exposes write_errors = 0 after
+/// normal CommitGate completion — this is the detection mechanism used by
+/// braid_receive to detect write failures.
+#[tokio::test]
+async fn test_commit_gate_stats_after_normal_run() {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut gate = CommitGate::new(rx);
+    let stats_arc = gate.stats_arc();
+
+    let handle = tokio::spawn(async move {
+        gate.run().await;
+        stats_arc.snapshot()
+    });
+
+    // Send a valid chunk then close the channel
+    let input = CommitGateInput {
+        data: b"hello world".to_vec(),
+        sequence_number: 0,
+        chunk_crc: 0,
+    };
+    tx.send(input).await.unwrap();
+    drop(tx);
+
+    let stats = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("gate should complete")
+        .unwrap();
+
+    assert_eq!(stats.chunks_committed, 1);
+    assert_eq!(stats.write_errors, 0);
+    assert_eq!(stats.bytes_written, 11);
+}
+
+/// Test: FileComplete with success=false is correctly serialized and
+/// deserialized — used by the invalid-filename and write-error paths.
+#[test]
+fn test_file_complete_failure_round_trip() {
+    let msg = ControlMessage::FileComplete {
+        success: false,
+        expected_hash: 0,
+        computed_hash: 0,
+    };
+    let bytes = msg.to_bytes();
+    let parsed = ControlMessage::try_from(bytes.as_slice()).unwrap();
+    assert_eq!(parsed, msg);
 }

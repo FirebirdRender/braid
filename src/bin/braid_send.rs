@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
 
-use braid::control::client::ControlClient;
+use braid::control::client::{ControlClient, ControlError};
 use braid::control::negotiation::{negotiate, NegotiationConfig};
 use braid::file_mode::sender::FileModeSender;
 use braid::flow::SenderReactor;
@@ -84,6 +84,7 @@ impl BraidSend {
     /// In `Mode::Pipe`, `input` must be `None`; the sender reads from stdin.
     /// In `Mode::File`, `input` must be `Some(path)`; the sender reads from
     /// the file and exchanges file-mode control messages with the receiver.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_mode(
         destination: SocketAddr,
         chunk_size: usize,
@@ -333,50 +334,87 @@ impl BraidSend {
             info!("progress reporter finished");
         });
 
-        // Spawn control message forwarding task (bidirectional: TCP ↔ SenderReactor)
-        // In file mode the task also forwards a single `FileComplete` to the
-        // wait logic via a oneshot channel, then exits so the run() loop
-        // can take over cleanup.
+        // IMPORTANT: When the pipeline finishes and shutdown is initiated, the
+        // flow reactor exits, which closes `control_out_rx`. In file mode the
+        // receiver has NOT yet sent `FileComplete` — it needs time to flush,
+        // compute the hash, and reply. We switch to a receive-only loop and
+        // keep polling TCP until FileComplete arrives or the connection fails.
         let (file_complete_tx, file_complete_rx) =
             tokio::sync::oneshot::channel::<braid::protocol::ControlMessage>();
+        let is_file_mode = self.mode == Mode::File;
         let mut client = client;
         let control_recv_handle = tokio::spawn(async move {
             let mut file_complete_tx = Some(file_complete_tx);
+            let mut send_closed = false;
             loop {
-                tokio::select! {
-                    result = client.recv_message() => {
-                        match result {
-                            Ok(msg) => {
-                                match &msg {
-                                    braid::protocol::ControlMessage::QueueStatus { .. } => {
-                                        let _ = queue_status_tx.send(msg).await;
-                                    }
-                                    braid::protocol::ControlMessage::FileComplete { .. } => {
-                                        if let Some(tx) = file_complete_tx.take() {
-                                            let _ = tx.send(msg);
+                if !send_closed {
+                    tokio::select! {
+                        result = client.recv_message() => {
+                            match result {
+                                Ok(msg) => {
+                                    match &msg {
+                                        braid::protocol::ControlMessage::QueueStatus { .. } => {
+                                            let _ = queue_status_tx.send(msg).await;
                                         }
-                                        break;
-                                    }
-                                    _ => {
-                                        trace!("ignored non-QueueStatus control message: {msg:?}");
+                                        braid::protocol::ControlMessage::FileComplete { .. } => {
+                                            if let Some(tx) = file_complete_tx.take() {
+                                                let _ = tx.send(msg);
+                                            }
+                                            break;
+                                        }
+                                        _ => {
+                                            trace!("ignored non-QueueStatus control message: {msg:?}");
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                warn!("control recv error: {e}");
-                                break;
-                            }
-                        }
-                    }
-                    msg = control_out_rx.recv() => {
-                        match msg {
-                            Some(msg) => {
-                                if let Err(e) = client.send_message(&msg).await {
-                                    warn!("failed to send control message: {e}");
+                                Err(e) => {
+                                    warn!("control recv error: {e}");
                                     break;
                                 }
                             }
-                            None => break,
+                        }
+                        msg = control_out_rx.recv() => {
+                            match msg {
+                                Some(msg) => {
+                                    if let Err(e) = client.send_message(&msg).await {
+                                        warn!("failed to send control message: {e}");
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    if is_file_mode {
+                                        send_closed = true;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    match client.recv_message().await {
+                        Ok(msg) => {
+                            match &msg {
+                                braid::protocol::ControlMessage::FileComplete { .. } => {
+                                    if let Some(tx) = file_complete_tx.take() {
+                                        let _ = tx.send(msg);
+                                    }
+                                    break;
+                                }
+                                braid::protocol::ControlMessage::QueueStatus { .. } => {
+                                    let _ = queue_status_tx.send(msg).await;
+                                }
+                                _ => {
+                                    trace!("ignored control message in file-mode wait: {msg:?}");
+                                }
+                            }
+                        }
+                        Err(ControlError::Timeout) => {
+                            trace!("control recv timeout while waiting for FileComplete, retrying");
+                        }
+                        Err(e) => {
+                            warn!("control recv error while waiting for FileComplete: {e}");
+                            break;
                         }
                     }
                 }

@@ -51,9 +51,7 @@ impl FileModeSender {
             .input_path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                BraidError::Protocol("invalid filename in input path")
-            })?
+            .ok_or(BraidError::Protocol("invalid filename in input path"))?
             .to_string();
 
         Ok(FileMetadata::from_basename(filename, filesize, file_crc32c))

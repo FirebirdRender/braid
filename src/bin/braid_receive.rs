@@ -8,14 +8,18 @@ use tracing::{error, info, trace, warn};
 use braid::buffer::pool::BufferPool;
 use braid::control::negotiation::accept_negotiation;
 use braid::control::server::ControlServer;
+use braid::file_mode::{output, receiver::FileModeReceiver, sanitize, FileMetadata};
 use braid::flow::ReceiverMonitor;
 use braid::progress::reporter::{ProgressReporter, ProgressVerbosity};
 use braid::protocol::crc::verify_fragment_crc;
 use braid::protocol::headers::FragmentHeader;
+use braid::protocol::ControlMessage;
 use braid::receiver::commit::{CommitGate, CommitGateInput};
 use braid::receiver::ordering::ChunkOrderer;
 use braid::receiver::reassembly::FragmentReassembler;
 use braid::shutdown::manager::ShutdownManager;
+
+use super::Mode;
 
 const DEFAULT_CHUNK_TIMEOUT_SECS: u64 = 60;
 /// Large channel capacity to absorb burst rates between sender and receiver.
@@ -29,9 +33,12 @@ pub struct BraidReceive {
     buffer_size: usize,
     mtu: usize,
     verbosity: ProgressVerbosity,
+    mode: Mode,
+    output_override: Option<PathBuf>,
 }
 
 impl BraidReceive {
+    #[allow(dead_code)]
     pub fn new(
         bind: SocketAddr,
         output: Option<PathBuf>,
@@ -45,6 +52,28 @@ impl BraidReceive {
             buffer_size,
             mtu,
             verbosity,
+            mode: Mode::Pipe,
+            output_override: None,
+        }
+    }
+
+    pub fn new_with_mode(
+        bind: SocketAddr,
+        output: Option<PathBuf>,
+        buffer_size: usize,
+        mtu: usize,
+        verbosity: ProgressVerbosity,
+        mode: Mode,
+        output_override: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            bind,
+            output,
+            buffer_size,
+            mtu,
+            verbosity,
+            mode,
+            output_override,
         }
     }
 
@@ -85,6 +114,54 @@ impl BraidReceive {
         let channels = result.channels;
         info!("negotiated {} channels", channels.len());
 
+        // ─── File mode setup (after negotiation, before pipeline) ──────────
+        let (file_mode_state, mut conn_opt) = if self.mode == Mode::File {
+            let msg = conn
+                .recv_message()
+                .await
+                .map_err(|e| format!("failed to receive FileStart: {e}"))?;
+            let fs = match msg {
+                ControlMessage::FileStart {
+                    filename,
+                    filesize,
+                    file_crc32c,
+                } => {
+                    let sanitized = match sanitize::sanitize_filename(&filename) {
+                        Ok(name) => name,
+                        Err(e) => {
+                            // Invalid filename from sender — report failure
+                            // before aborting so the sender knows the transfer failed.
+                            let fail_msg = ControlMessage::FileComplete {
+                                success: false,
+                                expected_hash: 0,
+                                computed_hash: 0,
+                            };
+                            if let Err(e) = conn.send_message(&fail_msg).await {
+                                warn!("failed to send FileComplete after invalid filename: {e}");
+                            }
+                            return Err(format!("invalid filename from sender: {e}").into());
+                        }
+                    };
+                    FileMetadata::from_basename(sanitized, filesize, file_crc32c)
+                }
+                _ => {
+                    return Err(
+                        format!("expected FileStart in file mode, got {msg:?}").into(),
+                    );
+                }
+            };
+            info!("file mode: receiving {}", fs);
+            let receiver_obj = FileModeReceiver::new(self.output_override.clone());
+            let output_path = receiver_obj
+                .resolve_output_path(&fs)
+                .await
+                .map_err(|e| format!("failed to resolve output path: {e}"))?;
+            info!("writing output to file: {}", output_path.display());
+            (Some((receiver_obj, output_path, fs.file_crc32c)), Some(conn))
+        } else {
+            (None, Some(conn))
+        };
+
         let (reassembly_tx, reassembly_rx) = mpsc::channel::<Vec<u8>>(DEFAULT_CHANNEL_CAPACITY);
         let (orderer_tx, orderer_rx) = mpsc::channel::<CommitGateInput>(DEFAULT_CHANNEL_CAPACITY);
         let (control_tx, mut control_rx) =
@@ -93,7 +170,11 @@ impl BraidReceive {
             mpsc::channel::<braid::protocol::ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
 
         let mut orderer = ChunkOrderer::new(orderer_tx, 0);
-        let mut commit_gate = if let Some(ref path) = self.output {
+        let mut commit_gate = if let Some((_, ref output_path, _)) = file_mode_state {
+            CommitGate::with_file(orderer_rx, &output_path.clone())
+                .await
+                .map_err(|e| format!("commit gate file create: {e}"))?
+        } else if let Some(ref path) = self.output {
             info!("writing output to file: {}", path.display());
             CommitGate::with_file(orderer_rx, path)
                 .await
@@ -101,6 +182,10 @@ impl BraidReceive {
         } else {
             CommitGate::new(orderer_rx)
         };
+
+        // Capture stats handle BEFORE moving commit_gate into the spawned task.
+        // Used after completion to detect write errors in file mode.
+        let commit_gate_stats = commit_gate.stats_arc();
 
         let mut monitor = ReceiverMonitor::new(
             buffer_pool,
@@ -258,36 +343,49 @@ impl BraidReceive {
         });
 
         // Forward: bidirectional TCP forwarding over the control connection.
-        // Sends QueueStatus messages from the monitor to the sender, and
-        // receives any incoming control messages from the sender.
-        let _control_forward_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    msg = queue_status_rx.recv() => {
-                        match msg {
-                            Some(msg) => {
-                                if let Err(e) = conn.send_message(&msg).await {
-                                    warn!("failed to send control message: {e}");
+        // In file mode, conn stays in the main scope for post-EOS FileComplete.
+        // In pipe mode, conn moves into this background task.
+        let _control_forward_handle = if self.mode == Mode::File {
+            None
+        } else {
+            let mut c = conn_opt.take().expect("conn should be present in pipe mode");
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        msg = queue_status_rx.recv() => {
+                            match msg {
+                                Some(msg) => {
+                                    if let Err(e) = c.send_message(&msg).await {
+                                        warn!("failed to send control message: {e}");
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                        result = c.recv_message() => {
+                            match result {
+                                Ok(ControlMessage::FileStart { .. }) => {
+                                    // Pipe mode does not expect FileStart. The sender
+                                    // should not send it unless file mode was negotiated.
+                                    // If it arrives, the receiver is being used in the
+                                    // wrong mode — abort immediately.
+                                    warn!("received FileStart in pipe mode, ignoring");
+                                    std::process::exit(1);
+                                }
+                                Ok(msg) => {
+                                    trace!("received control message: {msg:?}");
+                                }
+                                Err(e) => {
+                                    warn!("control recv error: {e}");
                                     break;
                                 }
-                            }
-                            None => break,
-                        }
-                    }
-                    result = conn.recv_message() => {
-                        match result {
-                            Ok(msg) => {
-                                trace!("received control message: {msg:?}");
-                            }
-                            Err(e) => {
-                                warn!("control recv error: {e}");
-                                break;
                             }
                         }
                     }
                 }
-            }
-        });
+            }))
+        };
 
         let progress_shutdown = shutdown.clone();
         let progress_handle = tokio::spawn(async move {
@@ -360,6 +458,80 @@ impl BraidReceive {
             _ = commit_timeout => {
                 info!("commit gate await timed out (expected during shutdown)");
             }
+        }
+
+        // ─── File mode: post-EOS hash validation + FileComplete ──────────
+        if let Some((ref receiver_obj, ref output_path, expected_hash)) = file_mode_state {
+            let mut conn = conn_opt.take().expect("conn should be available in file mode");
+
+            // Check if CommitGate encountered write errors during data transfer.
+            // If a write error occurred (e.g. disk full), we report failure without
+            // computing hash (the file may be incomplete or unwritable).
+            let gate_stats = commit_gate_stats.snapshot();
+            if gate_stats.write_errors > 0 {
+                error!(
+                    "commit gate encountered {} write errors, aborting file mode",
+                    gate_stats.write_errors
+                );
+                let fail_msg = ControlMessage::FileComplete {
+                    success: false,
+                    expected_hash: 0,
+                    computed_hash: 0,
+                };
+                if let Err(e) = conn.send_message(&fail_msg).await {
+                    warn!("failed to send FileComplete after write error: {e}");
+                }
+                shutdown.initiate();
+                let _ = monitor_cancel_tx.try_send(());
+                let _ = monitor_handle.await;
+                let _ = progress_handle.await;
+                return Err("write error during file transfer".into());
+            }
+
+            let computed = receiver_obj
+                .compute_hash(output_path)
+                .await
+                .map_err(|e| format!("failed to compute output file hash: {e}"))?;
+            let success = computed == expected_hash;
+            info!(
+                "file mode: validation result: expected={:08x}, computed={:08x}, success={}",
+                expected_hash, computed, success
+            );
+            let complete_msg = ControlMessage::FileComplete {
+                success,
+                expected_hash,
+                computed_hash: computed,
+            };
+            if let Err(e) = conn.send_message(&complete_msg).await {
+                warn!("failed to send FileComplete: {e}");
+            }
+            if !success {
+                error!(
+                    "file CRC32C mismatch: expected 0x{:08X}, got 0x{:08X}",
+                    expected_hash, computed
+                );
+                if let Err(e) = output::delete_output(output_path).await {
+                    warn!("failed to delete output file after hash mismatch: {e}");
+                }
+            } else {
+                info!(
+                    "file transferred successfully: crc32c=0x{:08X}",
+                    computed
+                );
+                eprintln!(
+                    "file transferred successfully (crc32c=0x{:08X})",
+                    computed
+                );
+            }
+            shutdown.initiate();
+            let result = if success { Ok(()) } else { Err("file hash mismatch".into()) };
+            let _ = monitor_cancel_tx.try_send(());
+            let _ = monitor_handle.await;
+            let _ = progress_handle.await;
+            for handle in worker_handles {
+                let _ = handle.await;
+            }
+            return result;
         }
 
         // Cancel the flow monitor so it can finish.

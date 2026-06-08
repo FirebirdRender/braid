@@ -71,7 +71,7 @@ pub struct CommitGateStatsAtomic {
 }
 
 impl CommitGateStatsAtomic {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             bytes_written: AtomicU64::new(0),
             chunks_committed: AtomicU64::new(0),
@@ -80,7 +80,9 @@ impl CommitGateStatsAtomic {
         }
     }
 
-    fn snapshot(&self) -> CommitGateStats {
+    /// Snapshot current stats — public so external code (e.g. braid_receive)
+    /// can check write errors after the CommitGate has finished.
+    pub fn snapshot(&self) -> CommitGateStats {
         CommitGateStats {
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
             chunks_committed: self.chunks_committed.load(Ordering::Relaxed),

@@ -232,12 +232,14 @@ async fn main() {
                 ProgressVerbosity::Normal
             };
 
-            let receiver = braid_receive::BraidReceive::new(
+            let receiver = braid_receive::BraidReceive::new_with_mode(
                 args.bind,
-                args.output,
+                args.output.clone(),
                 args.buffer_size,
                 args.mtu,
                 verbosity,
+                args.mode,
+                args.output.clone(),
             );
 
             if let Err(e) = receiver.run().await {

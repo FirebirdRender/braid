@@ -297,7 +297,7 @@ mod tests {
         chunk_buf.extend_from_slice(payload);
 
         let total_fragments =
-            (chunk_buf.len() + s.fragment_payload_size - 1) / s.fragment_payload_size;
+            chunk_buf.len().div_ceil(s.fragment_payload_size);
         assert_eq!(total_fragments, 1);
 
         // Build the fragment
@@ -342,7 +342,7 @@ mod tests {
         chunk_buf.extend_from_slice(&payload);
 
         let frag_payload_size = mtu - FragmentHeader::LEN;
-        let total_fragments = (chunk_buf.len() + frag_payload_size - 1) / frag_payload_size;
+        let total_fragments = chunk_buf.len().div_ceil(frag_payload_size);
         assert!(total_fragments > 1, "test requires multiple fragments");
 
         let mut fragments = Vec::new();
