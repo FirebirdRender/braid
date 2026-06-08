@@ -432,6 +432,11 @@ impl BraidReceive {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
+        // Drop the original reassembly_tx sender so the orderer's receiver
+        // sees channel close. Without this, the orderer blocks forever on
+        // rx.recv() because the main scope still holds a live sender.
+        drop(reassembly_tx);
+
         // Await orderer and commit gate with generous timeouts.
         // The orderer may be draining remaining chunks from its heap, and the
         // commit gate must flush its BufWriter before we exit. If we cancel the

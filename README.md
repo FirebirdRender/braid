@@ -122,6 +122,36 @@ dd if=/dev/zero bs=1M count=1024 | \
     --output /path/to/output.bin
 ```
 
+### File Mode (Sender-side file transfer)
+
+File mode enables the sender to transmit a file with metadata, filename sanitization, and integrity verification:
+
+```bash
+# Terminal 1 (receiver):
+./target/release/braid receive \
+    --bind 127.0.0.1:9000 \
+    --buffer-size 268435456 \
+    --output /path/to/output.bin
+
+# Terminal 2 (sender, file mode):
+./target/release/braid send \
+    --destination 127.0.0.1:9000 \
+    --mode file \
+    --input /path/to/input.bin
+```
+
+In file mode, the sender:
+- Reads the file and sends it with `FileStart`/`FileComplete` control messages
+- Streams CRC32C hash computation during transfer
+- Waits for the receiver to acknowledge file completion with hash verification
+- Reports transfer verification status (crc32c hash match)
+
+The receiver:
+- Sanitizes filenames to prevent path traversal attacks
+- Detects existing files and auto-renames with a numeric suffix (e.g., `file.bin.1`)
+- Computes CRC32C hash of the received file
+- Reports hash match/failure back to the sender
+
 ## CLI Reference
 
 ### `braid send`
@@ -168,7 +198,7 @@ On loopback, larger MTUs (8800–65535) give the best throughput. On real networ
 
 ## Performance
 
-BRAID achieves ~585 MiB/s on loopback at MTU 8800 with 4 parallel channels. Performance scales with MTU size and channel count.
+BRAID achieves ~455 MiB/s on loopback at MTU 1500 with 4 parallel channels (Criterion benchmark: `pipeline/full/65535`). Performance scales with MTU size and channel count — at MTU 8800, e2e throughput reaches ~669 MB/s (6.6 Gbps).
 
 Key optimizations:
 - **Zero-allocation fragment CRC**: chained `crc32fast::Hasher` avoids intermediate Vec
@@ -198,6 +228,12 @@ src/
 │   ├── reassembly.rs      # FragmentReassembler: fragments → chunks
 │   ├── ordering.rs        # ChunkOrderer: sequence number ordering
 │   └── commit.rs          # CommitGate: output writer
+├── file_mode/
+│   ├── hash.rs            # Streaming CRC32C hash computation
+│   ├── sanitize.rs        # Filename sanitization (path traversal prevention)
+│   ├── output.rs          # Overwrite detection with auto-rename
+│   ├── sender.rs          # FileModeSender: file metadata + hash
+│   └── receiver.rs        # FileModeReceiver: file output + hash verification
 ├── control/
 │   ├── client.rs          # Control protocol client
 │   ├── server.rs          # Control protocol server

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-08
+
+### Added
+
+- File mode (`--mode file --input <path>`): send files with metadata, filename sanitization, overwrite detection with auto-rename, streaming CRC32C hash verification, and progress display
+- `FileStart` and `FileComplete` control messages for file transfer handshake
+- `BraidError::FileHashMismatch` variant for integrity failure reporting
+- `FileSplitter` wrapper for file-specific splitter behavior via `AsyncRead`
+- `ChunkSplitter::run` now accepts `impl AsyncRead` instead of requiring stdin
+- E2E test suite for file mode: happy path (small, medium, empty file), edge cases
+
+### Changed
+
+- `ChunkSplitter::run` refactored to accept generic `impl AsyncRead` input
+
+### Fixed
+
+- Integration test hang: circular dependency deadlock in `braid_receive.rs` where `reassembly_tx` was held in scope while awaiting the orderer, preventing channel close — added `drop(reassembly_tx)` before orderer await
+- `fault_injection_test.rs` compilation errors: `run_loopback_with_tc` return type, missing `test_data()` helper, duplicate function
+- `test_sigint_during_receive` assertion: receiver now exits with code 0 (graceful shutdown via ShutdownManager) instead of non-zero
+- All source files formatted with `cargo fmt`
+
 ## [0.2.0] - YYYY-MM-DD
 
 ### Added

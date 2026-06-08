@@ -152,8 +152,7 @@ impl Drop for TcGuard {
 
 /// Run a full send+receive loopback under the given tc netem guard.
 ///
-/// Returns the received data.  The caller must hold a `TcGuard` (or pass
-/// `None` for clean loopback).
+/// The caller must hold a `TcGuard` (or pass `None` for clean loopback).
 #[allow(dead_code)]
 fn run_loopback_with_tc(data: &[u8], _timeout_secs: u64, _tc: Option<&TcGuard>) {
     let output_path = format!("/tmp/braid_fault_{}.bin", std::process::id());
@@ -230,6 +229,11 @@ fn run_loopback_with_tc(data: &[u8], _timeout_secs: u64, _tc: Option<&TcGuard>) 
         data.len(),
         "size mismatch after channel failure"
     );
+}
+
+/// Generate deterministic test data of the requested size.
+fn test_data(size: usize) -> Vec<u8> {
+    (0..size).map(|i| (i % 256) as u8).collect()
 }
 
 // ─── 9. Full Network Outage ──────────────────────────────────────────────────
@@ -528,10 +532,11 @@ fn test_sigint_during_receive() {
     let recv_output = wait_for_child_with_timeout(recv_child, 60);
 
     if let Some(output) = recv_output {
-        // Process exited on its own — verify graceful shutdown
+        // Process exited on its own — verify graceful shutdown (SIGINT now
+        // triggers clean shutdown via ShutdownManager, exit code 0)
         assert!(
-            !output.status.success(),
-            "receiver should exit with non-zero status after SIGINT"
+            output.status.success(),
+            "receiver should exit gracefully (code 0) after SIGINT"
         );
     } else {
         // Process didn't exit within timeout — that's acceptable if it's
@@ -573,11 +578,6 @@ fn wait_for_child_with_timeout(
             }
         }
     }
-}
-
-/// Generate deterministic test data of the given size.
-fn test_data(size: usize) -> Vec<u8> {
-    (0..size).map(|i| (i % 256) as u8).collect()
 }
 
 // ─── Non-root tc detection test ──────────────────────────────────────────────
