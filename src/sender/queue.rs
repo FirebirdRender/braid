@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use tokio::sync::mpsc;
 
 /// Per-worker queue statistics, accessible via `Arc<QueueWorkerStats>`.
@@ -84,11 +85,11 @@ impl QueueManagerStats {
 /// Per-worker state tracked by the queue manager.
 struct WorkerQueue {
     /// The queue of fragments awaiting dispatch to this worker.
-    queue: VecDeque<Vec<u8>>,
+    queue: VecDeque<Bytes>,
     /// Whether this worker is currently active (not failed).
     active: bool,
     /// Channel sender to push fragments to the worker's UDP send task.
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Bytes>,
     /// Per-worker statistics.
     stats: Arc<QueueWorkerStats>,
 }
@@ -108,6 +109,7 @@ pub struct QueueManager {
     rate_bucket: Cell<u64>,
     rate_last_check: Cell<Instant>,
     progress_bytes: Option<Arc<AtomicU64>>,
+    last_chunk_id: Cell<u32>,
 }
 
 impl QueueManager {
@@ -133,6 +135,7 @@ impl QueueManager {
             rate_bucket: Cell::new(0),
             rate_last_check: Cell::new(Instant::now()),
             progress_bytes: None,
+            last_chunk_id: Cell::new(0),
         }
     }
 
@@ -157,7 +160,7 @@ impl QueueManager {
     /// Register a worker with the queue manager.
     ///
     /// Each worker provides its channel sender and optional per-worker stats.
-    pub fn add_worker(&mut self, tx: mpsc::Sender<Vec<u8>>, stats: Arc<QueueWorkerStats>) {
+    pub fn add_worker(&mut self, tx: mpsc::Sender<Bytes>, stats: Arc<QueueWorkerStats>) {
         self.workers.push(WorkerQueue {
             queue: VecDeque::new(),
             active: true,
@@ -174,7 +177,7 @@ impl QueueManager {
     /// Dispatch a fragment to the least-loaded active worker.
     ///
     /// Returns `Ok(worker_index)` on success, or `Err` if all workers are down.
-    pub fn dispatch(&mut self, fragment: Vec<u8>) -> Result<usize, &'static str> {
+    pub fn dispatch(&mut self, fragment: Bytes) -> Result<usize, &'static str> {
         let frag_bytes = fragment.len();
 
         // Rate limit check: block if we're exceeding the configured max rate.
@@ -212,7 +215,7 @@ impl QueueManager {
     /// worker's local queue, flushes once, then checks backpressure.
     ///
     /// Returns `Ok(worker_index)` on success, or `Err` if all workers are down.
-    pub fn dispatch_batch(&mut self, batch: Vec<Vec<u8>>) -> Result<usize, &'static str> {
+    pub fn dispatch_batch(&mut self, batch: Vec<Bytes>) -> Result<usize, &'static str> {
         // Compute total batch size for rate limiting.
         let batch_bytes: usize = batch.iter().map(|f| f.len()).sum();
         self.check_rate_limit(batch_bytes);
@@ -231,6 +234,10 @@ impl QueueManager {
             let frag_bytes = fragment.len();
             self.workers[idx].stats.record_enqueue(frag_bytes);
             self.stats.record_dispatch();
+            let cid = Self::extract_chunk_id(fragment);
+            if cid > self.last_chunk_id.get() {
+                self.last_chunk_id.set(cid);
+            }
         }
         self.report_progress(batch_bytes);
         for fragment in batch {
@@ -260,7 +267,7 @@ impl QueueManager {
     pub fn retransmit(
         &mut self,
         worker_index: usize,
-        fragment: Vec<u8>,
+        fragment: Bytes,
     ) -> Result<(), &'static str> {
         if worker_index >= self.workers.len() {
             return Err("worker index out of bounds");
@@ -294,7 +301,7 @@ impl QueueManager {
         self.workers[worker_index].stats.record_error();
 
         // Redistribute pending fragments to other active workers.
-        let pending: Vec<Vec<u8>> = self.workers[worker_index].queue.drain(..).collect();
+        let pending = self.workers[worker_index].queue.drain(..).collect::<Vec<Bytes>>();
         let redistributed = pending.len();
 
         for fragment in pending {
@@ -374,6 +381,20 @@ impl QueueManager {
     /// Check whether all workers are down.
     pub fn all_workers_down(&self) -> bool {
         self.active_worker_count() == 0
+    }
+
+    /// Returns the last seen chunk ID (sequence number) from dispatched fragments.
+    /// Used by the reconnect flow to determine the resume point.
+    pub fn last_chunk_id(&self) -> u32 {
+        self.last_chunk_id.get()
+    }
+
+    fn extract_chunk_id(fragment: &[u8]) -> u32 {
+        if fragment.len() >= 4 {
+            u32::from_be_bytes([fragment[0], fragment[1], fragment[2], fragment[3]])
+        } else {
+            0
+        }
     }
 
     /// Signal the splitter to pause (backpressure).
@@ -486,7 +507,7 @@ pub struct QueueManagerBuilder {
 }
 
 /// A pair of a fragment receiver and its associated worker stats.
-pub type WorkerReceiver = (mpsc::Receiver<Vec<u8>>, Arc<QueueWorkerStats>);
+pub type WorkerReceiver = (mpsc::Receiver<Bytes>, Arc<QueueWorkerStats>);
 
 impl QueueManagerBuilder {
     /// Create a new builder.
@@ -576,7 +597,7 @@ mod tests {
     #[test]
     fn dispatches_to_first_worker_when_all_empty() {
         let (mut mgr, _rx) = make_manager(3);
-        let result = mgr.dispatch(vec![0u8; 100]);
+        let result = mgr.dispatch(Bytes::from(vec![0u8; 100]));
         assert!(result.is_ok());
         assert_eq!(mgr.stats.fragments_dispatched.load(Ordering::Relaxed), 1);
     }
@@ -596,7 +617,7 @@ mod tests {
             .store(300, Ordering::Relaxed);
         // Worker 2 has 0 load
 
-        let result = mgr.dispatch(vec![0u8; 100]);
+        let result = mgr.dispatch(Bytes::from(vec![0u8; 100]));
         assert!(result.is_ok());
         // Worker 2 has least load (0)
         assert_eq!(result.unwrap(), 2);
@@ -614,7 +635,7 @@ mod tests {
             mgr.workers[i].active = false;
         }
 
-        let result = mgr.dispatch(vec![0u8; 100]);
+        let result = mgr.dispatch(Bytes::from(vec![0u8; 100]));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "all workers are down");
 
@@ -633,12 +654,12 @@ mod tests {
             QueueManagerBuilder::new(2).channel_capacity(1).build();
 
         // First dispatch fills worker 0's channel
-        mgr.dispatch(vec![1u8; 10]).ok();
+        mgr.dispatch(Bytes::from(vec![1u8; 10])).ok();
         // Second dispatch stays in local queue
-        mgr.dispatch(vec![2u8; 10]).ok();
+        mgr.dispatch(Bytes::from(vec![2u8; 10])).ok();
 
         // Retransmit a fragment to worker 0's head
-        let retransmit_data = vec![99u8; 10];
+        let retransmit_data = Bytes::from(vec![99u8; 10]);
         let result = mgr.retransmit(0, retransmit_data);
         assert!(result.is_ok());
 
@@ -654,7 +675,7 @@ mod tests {
     #[test]
     fn retransmit_to_invalid_worker_returns_error() {
         let (mut mgr, receivers) = make_manager(2);
-        let result = mgr.retransmit(5, vec![0u8; 10]);
+        let result = mgr.retransmit(5, Bytes::from(vec![0u8; 10]));
         assert!(result.is_err());
         drop(receivers);
     }
@@ -663,7 +684,7 @@ mod tests {
     fn retransmit_to_failed_worker_returns_error() {
         let (mut mgr, receivers) = make_manager(2);
         mgr.workers[0].active = false;
-        let result = mgr.retransmit(0, vec![0u8; 10]);
+        let result = mgr.retransmit(0, Bytes::from(vec![0u8; 10]));
         assert!(result.is_err());
         drop(receivers);
     }
@@ -677,8 +698,8 @@ mod tests {
             QueueManagerBuilder::new(2).channel_capacity(1).build();
 
         // Manually push fragments to worker 0's local queue
-        mgr.workers[0].queue.push_back(vec![1u8; 10]);
-        mgr.workers[0].queue.push_back(vec![2u8; 10]);
+        mgr.workers[0].queue.push_back(Bytes::from(vec![1u8; 10]));
+        mgr.workers[0].queue.push_back(Bytes::from(vec![2u8; 10]));
         mgr.workers[0].stats.record_enqueue(10);
         mgr.workers[0].stats.record_enqueue(10);
 
@@ -846,7 +867,7 @@ mod tests {
         let (mut mgr, mut receivers) = make_manager(2);
 
         // Dispatch a fragment — it should flush to the channel
-        let data = vec![42u8; 64];
+        let data = Bytes::from(vec![42u8; 64]);
         let idx = mgr.dispatch(data.clone()).expect("dispatch ok");
 
         // The selected worker's local queue should be empty (flushed to channel)
@@ -904,15 +925,56 @@ mod tests {
             .build();
 
         // First dispatch fills the channel
-        mgr.dispatch(vec![1u8; 10]).ok();
+        mgr.dispatch(Bytes::from(vec![1u8; 10])).ok();
 
         // Second dispatch should stay in local queue since channel is full
-        mgr.dispatch(vec![2u8; 10]).ok();
+        mgr.dispatch(Bytes::from(vec![2u8; 10])).ok();
 
         // Worker 0 should have 1 item in local queue (channel capacity is 1)
         assert_eq!(mgr.workers[0].queue.len(), 1);
 
         // Drain the channel
         drop(receivers);
+    }
+
+    // ─── last_chunk_id tracking ───────────────────────────────────────────
+
+    #[test]
+    fn last_chunk_id_tracks_max_chunk_id_from_batch() {
+        let (mut mgr, receivers) = make_manager(2);
+        assert_eq!(mgr.last_chunk_id(), 0, "initial last_chunk_id should be 0");
+
+        // Create fragments with known chunk_ids in their first 4 bytes (BE).
+        let fragment_1 = Bytes::from(vec![0u8, 0u8, 0u8, 5u8, 0xAA, 0xBB]); // chunk_id=5
+        let fragment_2 = Bytes::from(vec![0u8, 0u8, 0u8, 3u8, 0xCC, 0xDD]); // chunk_id=3
+        let batch = vec![fragment_1, fragment_2];
+        let _ = mgr.dispatch_batch(batch).ok();
+        assert_eq!(mgr.last_chunk_id(), 5, "should track max chunk_id=5");
+
+        let fragment_3 = Bytes::from(vec![0u8, 0u8, 0u8, 10u8]); // chunk_id=10
+        let batch = vec![fragment_3];
+        let _ = mgr.dispatch_batch(batch).ok();
+        assert_eq!(mgr.last_chunk_id(), 10, "should update to chunk_id=10");
+
+        drop(receivers);
+    }
+
+    #[test]
+    fn extract_chunk_id_parses_big_endian_u32() {
+        // chunk_id=0x01020304 encoded as BE bytes
+        let fragment = Bytes::from(vec![0x01, 0x02, 0x03, 0x04, 0xFF]);
+        assert_eq!(QueueManager::extract_chunk_id(&fragment), 0x01020304);
+    }
+
+    #[test]
+    fn extract_chunk_id_returns_zero_for_short_slice() {
+        let fragment = Bytes::from(vec![0x01, 0x02]); // less than 4 bytes
+        assert_eq!(QueueManager::extract_chunk_id(&fragment), 0);
+    }
+
+    #[test]
+    fn extract_chunk_id_zero_for_empty() {
+        let fragment: Bytes = Bytes::new();
+        assert_eq!(QueueManager::extract_chunk_id(&fragment), 0);
     }
 }

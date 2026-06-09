@@ -4,9 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
 
+use braid::buffer::pool::BufferPool;
 use braid::control::client::{ControlClient, ControlError};
 use braid::control::negotiation::{negotiate, NegotiationConfig};
 use braid::file_mode::sender::FileModeSender;
@@ -54,6 +56,16 @@ pub struct BraidSend {
     verbosity: ProgressVerbosity,
     mode: Mode,
     input: Option<PathBuf>,
+    compress_lz4: bool,
+    compress_zstd: bool,
+    #[allow(dead_code)]
+    retry: bool,
+    #[allow(dead_code)]
+    max_retries: u32,
+    #[allow(dead_code)]
+    retry_delay: u64,
+    #[allow(dead_code)]
+    channel_failure_threshold: u32,
 }
 
 impl BraidSend {
@@ -76,6 +88,8 @@ impl BraidSend {
             verbosity,
             Mode::Pipe,
             None,
+            true,  // compress_lz4
+            false, // compress_zstd
         )
     }
 
@@ -94,6 +108,8 @@ impl BraidSend {
         verbosity: ProgressVerbosity,
         mode: Mode,
         input: Option<PathBuf>,
+        compress_lz4: bool,
+        compress_zstd: bool,
     ) -> Self {
         Self {
             destination,
@@ -104,6 +120,48 @@ impl BraidSend {
             verbosity,
             mode,
             input,
+            compress_lz4,
+            compress_zstd,
+            retry: false,
+            max_retries: 3,
+            retry_delay: 1000,
+            channel_failure_threshold: 3,
+        }
+    }
+
+    /// Extended constructor with retry and channel failure parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_retry(
+        destination: SocketAddr,
+        chunk_size: usize,
+        channels: usize,
+        mtu: usize,
+        max_rate: u64,
+        verbosity: ProgressVerbosity,
+        mode: Mode,
+        input: Option<PathBuf>,
+        compress_lz4: bool,
+        compress_zstd: bool,
+        retry: bool,
+        max_retries: u32,
+        retry_delay: u64,
+        channel_failure_threshold: u32,
+    ) -> Self {
+        Self {
+            destination,
+            chunk_size,
+            channels,
+            mtu,
+            max_rate,
+            verbosity,
+            mode,
+            input,
+            compress_lz4,
+            compress_zstd,
+            retry,
+            max_retries,
+            retry_delay,
+            channel_failure_threshold,
         }
     }
 
@@ -120,9 +178,20 @@ impl BraidSend {
 
         // ─── Step 2: Connect to receiver ─────────────────────────────────
         info!("connecting to receiver at {}", self.destination);
-        let mut client = ControlClient::connect(self.destination)
+        let mut client = if self.retry {
+            ControlClient::connect_with_retry(
+                self.destination,
+                self.max_retries,
+                Duration::from_millis(self.retry_delay),
+                Duration::from_secs(10),
+            )
             .await
-            .map_err(|e| format!("control connection failed: {e}"))?;
+            .map_err(|e| format!("control connection failed after retries: {e}"))?
+        } else {
+            ControlClient::connect(self.destination)
+                .await
+                .map_err(|e| format!("control connection failed: {e}"))?
+        };
 
         // ─── Step 3: Negotiate channels ──────────────────────────────────
         let channel_count = if self.channels > 0 {
@@ -137,6 +206,8 @@ impl BraidSend {
             min_chunk: DEFAULT_MIN_CHUNK_LOG2,
             max_chunk: DEFAULT_MAX_CHUNK_LOG2,
             mtu: mtu_log2,
+            compression_lz4: self.compress_lz4,
+            compression_zstd: self.compress_zstd,
         };
         info!("negotiating {} channels with receiver", channel_count);
         let result = negotiate(&mut client, config)
@@ -182,16 +253,20 @@ impl BraidSend {
 
         // ─── Step 4: Create UDP send workers ─────────────────────────────
         let mut worker_sockets = Vec::with_capacity(channels.len());
-        for ch in &channels {
+        let mut health_rxs = Vec::with_capacity(channels.len());
+        for ch in channels.iter() {
+            let (health_tx, health_rx) = mpsc::channel::<braid::sender::worker::WorkerResult>(16);
             let worker = UdpSendWorker::new(
                 0,
                 SocketAddr::new(self.destination.ip(), ch.port),
                 DEFAULT_SO_SNDBUF,
                 DEFAULT_SEND_TIMEOUT,
                 Arc::new(UdpSendWorkerStats::default()),
+                Some(health_tx),
             );
             let socket = worker.bind().await?;
             worker_sockets.push((worker, socket));
+            health_rxs.push(health_rx);
         }
 
         // ─── Step 5: Build QueueManager ──────────────────────────────────
@@ -220,7 +295,7 @@ impl BraidSend {
         }
 
         // ─── Step 7: Create pipeline channels ────────────────────────────
-        let (fragment_tx, fragment_rx) = mpsc::channel::<Vec<Vec<u8>>>(DEFAULT_CHANNEL_CAPACITY);
+        let (fragment_tx, fragment_rx) = mpsc::channel::<Vec<Bytes>>(DEFAULT_CHANNEL_CAPACITY);
 
         // ─── Step 8: Create progress reporter ────────────────────────────
         let mut progress = if self.mode == Mode::File {
@@ -234,9 +309,12 @@ impl BraidSend {
             ProgressReporter::new(DEFAULT_PROGRESS_INTERVAL, self.verbosity)
         };
         queue_manager.set_progress_bytes(progress.bytes_tx());
+        let progress_bytes_tx = progress.bytes_tx();
+        let input_path = self.input.clone();
 
         // ─── Step 9: Spawn pipeline tasks ────────────────────────────────
         // Spawn ChunkSplitter
+        let splitter_pool = BufferPool::new(4, self.mtu);
         let splitter = ChunkSplitter::new(
             if self.chunk_size > 0 {
                 self.chunk_size
@@ -244,6 +322,7 @@ impl BraidSend {
                 braid::adaptive::chunk_size::DEFAULT_INITIAL_CHUNK
             },
             self.mtu,
+            splitter_pool,
         );
         let (splitter_pause_tx, splitter_pause_rx) = mpsc::channel::<bool>(16);
         let splitter_handle = if let Some(file) = file_input {
@@ -270,28 +349,84 @@ impl BraidSend {
             })
         };
 
-        // Spawn QueueManager dispatch loop
+        // Spawn QueueManager dispatch loop.
+        // Returns QmExitReason via oneshot so main task knows whether to reconnect.
+        #[derive(Debug)]
+        enum QmExitReason {
+            Normal,
+            AllWorkersDown { last_chunk_id: u32 },
+        }
+        let (qm_exit_tx, mut qm_exit_rx) = tokio::sync::oneshot::channel::<QmExitReason>();
         let qm_shutdown = shutdown.clone();
         let qm_handle = tokio::spawn(async move {
             info!("queue manager dispatch loop started");
             let mut rx = fragment_rx;
-            while let Some(batch) = rx.recv().await {
-                if qm_shutdown.is_shutting_down() {
-                    break;
-                }
-                // Dispatch the entire batch to a single worker
-                if let Err(e) = queue_manager.dispatch_batch(batch) {
-                    error!("queue manager dispatch_batch error: {}", e);
-                    break;
+            let mut exit_reason = QmExitReason::Normal;
+
+            // Merge all health_rx channels into a single receiver.
+            let (health_merge_tx, mut health_merge_rx) = mpsc::channel::<(usize, braid::sender::worker::WorkerResult)>(128);
+            for (i, mut hrx) in health_rxs.into_iter().enumerate() {
+                let htx = health_merge_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(result) = hrx.recv().await {
+                        if htx.send((i, result)).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            // Drop the clone held by this scope so the merge rx closes when all forwarding tasks finish.
+            drop(health_merge_tx);
+
+            loop {
+                tokio::select! {
+                    batch = rx.recv() => {
+                        match batch {
+                            Some(batch) => {
+                                if qm_shutdown.is_shutting_down() {
+                                    break;
+                                }
+                                if let Err(e) = queue_manager.dispatch_batch(batch) {
+                                    error!("queue manager dispatch_batch error: {}", e);
+                                    if queue_manager.all_workers_down() {
+                                        exit_reason = QmExitReason::AllWorkersDown {
+                                            last_chunk_id: queue_manager.last_chunk_id(),
+                                        };
+                                    }
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    health = health_merge_rx.recv() => {
+                        match health {
+                            Some((worker_idx, braid::sender::worker::WorkerResult::Failed)) => {
+                                warn!("health: worker {} reported failure, marking as failed", worker_idx);
+                                if queue_manager.active_worker_count() > 0 {
+                                    queue_manager.mark_worker_failed(worker_idx);
+                                }
+                            }
+                            Some((_worker_idx, braid::sender::worker::WorkerResult::Done)) => {
+                                trace!("health: worker {} finished normally", _worker_idx);
+                            }
+                            None => {
+                                trace!("health merge channel closed");
+                            }
+                        }
+                    }
                 }
             }
+            let _ = qm_exit_tx.send(exit_reason);
             info!("queue manager dispatch loop finished");
         });
 
         // Spawn FlowController (SenderReactor)
         let (queue_status_tx, queue_status_rx) =
             mpsc::channel::<braid::protocol::ControlMessage>(16);
-        let (_control_out_tx, mut control_out_rx) =
+        let (control_out_tx, mut control_out_rx) =
+            mpsc::channel::<braid::protocol::ControlMessage>(16);
+        let (reconnect_resp_tx, mut reconnect_resp_rx) =
             mpsc::channel::<braid::protocol::ControlMessage>(16);
         let mut sender_reactor = SenderReactor::new(1024, queue_status_rx);
         let flow_handle = tokio::spawn(async move {
@@ -338,11 +473,9 @@ impl BraidSend {
             info!("progress reporter finished");
         });
 
-        // IMPORTANT: When the pipeline finishes and shutdown is initiated, the
-        // flow reactor exits, which closes `control_out_rx`. In file mode the
-        // receiver has NOT yet sent `FileComplete` — it needs time to flush,
-        // compute the hash, and reply. We switch to a receive-only loop and
-        // keep polling TCP until FileComplete arrives or the connection fails.
+        // TCP control forwarding loop.
+        // Forwards Ack/ChannelOpened to reconnect_resp_tx so main task can
+        // implement the reconnect protocol.
         let (file_complete_tx, file_complete_rx) =
             tokio::sync::oneshot::channel::<braid::protocol::ControlMessage>();
         let is_file_mode = self.mode == Mode::File;
@@ -365,6 +498,10 @@ impl BraidSend {
                                                 let _ = tx.send(msg);
                                             }
                                             break;
+                                        }
+                                        braid::protocol::ControlMessage::Ack { .. }
+                                        | braid::protocol::ControlMessage::ChannelOpened { .. } => {
+                                            let _ = reconnect_resp_tx.send(msg).await;
                                         }
                                         _ => {
                                             trace!("ignored non-QueueStatus control message: {msg:?}");
@@ -407,6 +544,10 @@ impl BraidSend {
                             braid::protocol::ControlMessage::QueueStatus { .. } => {
                                 let _ = queue_status_tx.send(msg).await;
                             }
+                            braid::protocol::ControlMessage::Ack { .. }
+                            | braid::protocol::ControlMessage::ChannelOpened { .. } => {
+                                let _ = reconnect_resp_tx.send(msg).await;
+                            }
                             _ => {
                                 trace!("ignored control message in file-mode wait: {msg:?}");
                             }
@@ -424,12 +565,7 @@ impl BraidSend {
             info!("control forwarding task finished");
         });
 
-        // ─── Step 10: Wait for completion or shutdown ────────────────────
-        // Wait for the splitter to finish (stdin EOF or error). The signal
-        // handler calls shutdown.initiate() on SIGINT, which causes UDP workers
-        // to exit, which closes the fragment channel, which causes the splitter
-        // to error with "channel closed" and exit.
-        // Use a timeout to prevent hanging if stdin doesn't close.
+        // ─── Step 10: Wait for completion or reconnect ───────────────────
         let splitter_timeout = tokio::time::sleep(Duration::from_secs(5));
         tokio::select! {
             _ = splitter_handle => {}
@@ -439,9 +575,210 @@ impl BraidSend {
         }
         let _ = qm_handle.await;
 
-        // Signal shutdown so all shutdown-aware tasks (progress reporter,
-        // workers, backpressure handler) can exit cleanly on normal completion.
-        shutdown.initiate();
+        // Check if QM exited due to all workers being down.
+        let reconnect_last_chunk = match qm_exit_rx.try_recv() {
+            Ok(QmExitReason::AllWorkersDown { last_chunk_id }) => Some(last_chunk_id),
+            _ => None,
+        };
+
+        if let Some(last_chunk_id) = reconnect_last_chunk {
+            info!("all workers down, initiating reconnect from chunk_id={}", last_chunk_id);
+
+            // Send Reconnect via control channel.
+            let reconnect_msg = ControlMessage::Reconnect {
+                last_sequence_number: last_chunk_id as u64,
+            };
+            control_out_tx
+                .send(reconnect_msg)
+                .await
+                .map_err(|e| format!("failed to send Reconnect: {e}"))?;
+
+            // Wait for Ack with 10s timeout.
+            let ack = tokio::time::timeout(
+                Duration::from_secs(10),
+                reconnect_resp_rx.recv(),
+            )
+            .await
+            .map_err(|_| "timeout waiting for Ack after Reconnect")?
+            .ok_or("reconnect_resp channel closed while waiting for Ack")?;
+
+            match &ack {
+                ControlMessage::Ack { sequence_number } => {
+                    info!("received Ack for sequence_number={}", sequence_number);
+                }
+                ControlMessage::Nack { sequence_number, reason } => {
+                    return Err(format!(
+                        "receiver rejected reconnect: Nack(sequence_number={}, reason={})",
+                        sequence_number, reason
+                    ).into());
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected control message after Reconnect: {:?}",
+                        other
+                    ).into());
+                }
+            }
+
+            // Receive ChannelOpened messages (one per new channel).
+            let mut new_channels: Vec<(u16, u16)> = Vec::new();
+            loop {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    reconnect_resp_rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(ControlMessage::ChannelOpened { channel_id, port })) => {
+                        info!("received ChannelOpened: channel_id={}, port={}", channel_id, port);
+                        new_channels.push((channel_id, port));
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+
+            if new_channels.is_empty() {
+                return Err("reconnect failed: no new channels received from receiver".into());
+            }
+
+            info!(
+                "reconnect complete: {} new channels, resuming from chunk_id={}",
+                new_channels.len(),
+                last_chunk_id
+            );
+
+            // Create new UDP send workers.
+            let mut new_worker_sockets = Vec::with_capacity(new_channels.len());
+            for (_channel_id, port) in &new_channels {
+                let worker = UdpSendWorker::new(
+                    0,
+                    SocketAddr::new(self.destination.ip(), *port as u16),
+                    DEFAULT_SO_SNDBUF,
+                    DEFAULT_SEND_TIMEOUT,
+                    Arc::new(UdpSendWorkerStats::default()),
+                    None, // health reporting not wired on reconnect path
+                );
+                let socket = worker.bind().await?;
+                new_worker_sockets.push((worker, socket));
+            }
+
+            // Build new QueueManager.
+            let (bp_tx_new, mut bp_rx_new) = mpsc::channel::<bool>(16);
+            let mut qm_builder = QueueManagerBuilder::new(new_channels.len())
+                .high_watermark(DEFAULT_HIGH_WATERMARK)
+                .channel_capacity(DEFAULT_CHANNEL_CAPACITY)
+                .backpressure_tx(bp_tx_new);
+            if self.max_rate > 0 {
+                qm_builder = qm_builder.max_rate(self.max_rate);
+            }
+            let (mut new_queue_manager, worker_receivers) = qm_builder.build();
+            new_queue_manager.set_progress_bytes(progress_bytes_tx);
+
+            let mut new_worker_handles = Vec::with_capacity(new_channels.len());
+            for (i, ((worker, socket), (rx, _stats))) in
+                new_worker_sockets.into_iter().zip(worker_receivers).enumerate()
+            {
+                let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                let handle = tokio::spawn(async move {
+                    info!("reconnect UDP send worker {} started on port {}", i, local_port);
+                    worker.run(socket, rx).await;
+                    info!("reconnect UDP send worker {} finished", i);
+                });
+                new_worker_handles.push(handle);
+            }
+
+            // Restart the splitter (stdin or file).
+            let (new_fragment_tx, new_fragment_rx) =
+                mpsc::channel::<Vec<Bytes>>(DEFAULT_CHANNEL_CAPACITY);
+            let reconnect_pool = BufferPool::new(4, self.mtu);
+            let splitter = ChunkSplitter::new(
+                if self.chunk_size > 0 {
+                    self.chunk_size
+                } else {
+                    braid::adaptive::chunk_size::DEFAULT_INITIAL_CHUNK
+                },
+                self.mtu,
+                reconnect_pool,
+            );
+            let (splitter_pause_tx_new, splitter_pause_rx_new) = mpsc::channel::<bool>(16);
+            let new_splitter_handle = if let Some(path) = &input_path {
+                let file = tokio::fs::File::open(path).await
+                    .map_err(|e| format!("failed to reopen input file for reconnect: {e}"))?;
+                tokio::spawn(async move {
+                    info!("reconnect chunk splitter started (file input)");
+                    if let Err(e) = splitter
+                        .run(new_fragment_tx, Some(splitter_pause_rx_new), file)
+                        .await
+                    {
+                        error!("reconnect chunk splitter error: {}", e);
+                    }
+                    info!("reconnect chunk splitter finished");
+                })
+            } else {
+                tokio::spawn(async move {
+                    info!("reconnect chunk splitter started (stdin)");
+                    if let Err(e) = splitter
+                        .run(new_fragment_tx, Some(splitter_pause_rx_new), tokio::io::stdin())
+                        .await
+                    {
+                        error!("reconnect chunk splitter error: {}", e);
+                    }
+                    info!("reconnect chunk splitter finished");
+                })
+            };
+
+            let new_qm_shutdown = shutdown.clone();
+            let new_qm_handle = tokio::spawn(async move {
+                info!("reconnect queue manager dispatch loop started");
+                let mut rx = new_fragment_rx;
+                while let Some(batch) = rx.recv().await {
+                    if new_qm_shutdown.is_shutting_down() {
+                        break;
+                    }
+                    if let Err(e) = new_queue_manager.dispatch_batch(batch) {
+                        error!("reconnect queue manager dispatch_batch error: {}", e);
+                        break;
+                    }
+                }
+                info!("reconnect queue manager dispatch loop finished");
+            });
+
+            let new_bp_shutdown = shutdown.clone();
+            let new_bp_handle = tokio::spawn(async move {
+                info!("reconnect backpressure handler started");
+                while let Some(paused) = bp_rx_new.recv().await {
+                    if new_bp_shutdown.is_shutting_down() {
+                        break;
+                    }
+                    if paused {
+                        info!("reconnect backpressure: pausing splitter");
+                        let _ = splitter_pause_tx_new.send(true).await;
+                    } else {
+                        info!("reconnect backpressure: resuming splitter");
+                        let _ = splitter_pause_tx_new.send(false).await;
+                    }
+                }
+                info!("reconnect backpressure handler finished");
+            });
+
+            let new_splitter_timeout = tokio::time::sleep(Duration::from_secs(5));
+            tokio::select! {
+                _ = new_splitter_handle => {}
+                _ = new_splitter_timeout => {
+                    info!("reconnect splitter await timed out");
+                }
+            }
+            shutdown.initiate();
+            let _ = new_qm_handle.await;
+            let _ = new_bp_handle.await;
+            for handle in new_worker_handles {
+                let _ = handle.await;
+            }
+        } else {
+            shutdown.initiate();
+        }
 
         // Flow handle may block on queue_status_rx if no status messages arrive.
         let flow_timeout = tokio::time::sleep(Duration::from_secs(2));
@@ -462,8 +799,7 @@ impl BraidSend {
         }
 
         // In file mode, wait for the receiver to acknowledge file completion
-        // and verify the transfer's integrity. The control forwarding task
-        // forwards a single FileComplete message via the oneshot channel.
+        // and verify the transfer's integrity.
         let file_mode_result: Result<(), String> = if self.mode == Mode::File {
             match tokio::time::timeout(Duration::from_secs(30), file_complete_rx).await {
                 Err(_) => {
@@ -632,7 +968,7 @@ mod tests {
     #[test]
     fn queue_manager_dispatch_to_worker() {
         let (mut mgr, _receivers) = QueueManagerBuilder::new(2).channel_capacity(64).build();
-        let result = mgr.dispatch(vec![0u8; 100]);
+        let result = mgr.dispatch(Bytes::from(vec![0u8; 100]));
         assert!(result.is_ok());
         assert_eq!(mgr.stats().fragments_dispatched.load(Ordering::Relaxed), 1);
     }
@@ -643,7 +979,7 @@ mod tests {
         mgr.mark_worker_failed(0);
         mgr.mark_worker_failed(1);
         assert!(mgr.all_workers_down());
-        let result = mgr.dispatch(vec![0u8; 100]);
+        let result = mgr.dispatch(Bytes::from(vec![0u8; 100]));
         assert!(result.is_err());
     }
 }

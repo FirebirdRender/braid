@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::{debug, error, info};
 
@@ -51,10 +52,10 @@ pub struct CommitGate {
 ///
 /// The `ChunkOrderer` strips the `ChunkHeader` before emitting, so the commit
 /// gate needs the sequence number and CRC separately to verify.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CommitGateInput {
     /// The chunk data payload (no headers).
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// Sequence number from the chunk header.
     pub sequence_number: u64,
     /// Chunk CRC from the chunk header.
@@ -212,7 +213,7 @@ mod tests {
     fn make_input(seq: u64, data: &[u8]) -> CommitGateInput {
         let chunk_crc = compute_chunk_crc(seq, data);
         CommitGateInput {
-            data: data.to_vec(),
+            data: Bytes::copy_from_slice(data),
             sequence_number: seq,
             chunk_crc,
         }
@@ -268,7 +269,7 @@ mod tests {
         let inputs = vec![
             make_input(0, b"good data"),
             CommitGateInput {
-                data: b"bad data".to_vec(),
+                data: Bytes::copy_from_slice(b"bad data"),
                 sequence_number: 1,
                 chunk_crc: 0xDEADBEEF,
             },
@@ -294,7 +295,7 @@ mod tests {
 
         tx.send(make_input(0, b"valid data")).await.unwrap();
         tx.send(CommitGateInput {
-            data: b"corrupt data".to_vec(),
+            data: Bytes::copy_from_slice(b"corrupt data"),
             sequence_number: 1,
             chunk_crc: 0xBADF00D,
         })

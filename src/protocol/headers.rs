@@ -3,6 +3,10 @@ use std::fmt;
 
 use bytes::{Buf, BufMut, BytesMut};
 
+pub const COMPRESSION_NONE: u8 = 0x00;
+pub const COMPRESSED_LZ4: u8 = 0x01;
+pub const COMPRESSED_ZSTD: u8 = 0x02;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FragmentHeader {
     pub chunk_id: u32,
@@ -131,5 +135,24 @@ impl From<ChunkHeader> for Vec<u8> {
 impl fmt::Display for ChunkHeader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ChunkHeader(magic=0x{:02X}, flags={}, payload_length={}, sequence_number={}, chunk_crc={})", self.magic, self.flags, self.payload_length, self.sequence_number, self.chunk_crc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_constants_have_correct_values() {
+        assert_eq!(COMPRESSION_NONE, 0x00);
+        assert_eq!(COMPRESSED_LZ4, 0x01);
+        assert_eq!(COMPRESSED_ZSTD, 0x02);
+    }
+
+    #[test]
+    fn compression_constants_are_mutually_exclusive() {
+        assert_eq!(COMPRESSION_NONE & COMPRESSED_LZ4, 0);
+        assert_eq!(COMPRESSION_NONE & COMPRESSED_ZSTD, 0);
+        assert_eq!(COMPRESSED_LZ4 & COMPRESSED_ZSTD, 0);
     }
 }

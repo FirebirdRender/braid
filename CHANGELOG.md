@@ -7,7 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-06-08
+## [0.4.0] - 2026-06-09
+
+### Added
+
+- **Buffer pool rewrite**: Semaphore-based `BufferPool` with `BytesMut` storage, `PoolBuffer` with auto-return on drop, `acquire_many(n)` for batch operations
+- **Zero-copy pipeline**: All hot-path channel types migrated from `Vec<u8>` to `bytes::Bytes` — splitter, queue manager, UDP receive worker, reassembly, ordering, and commit gate
+- **BufferPool integration**: Pool buffers used in hot paths — UDP receive worker (replaces `vec![0u8; mtu]`), fragment reassembly (replaces `Vec::with_capacity`), and chunk splitter read buffer
+- **Connection resilience**: `ChannelHealth` module for per-channel failure tracking with configurable threshold
+- **Connection retry**: `ControlClient::connect_with_retry()` with exponential backoff (doubles, capped at 60s)
+- **Retry CLI flags**: `--retry`, `--max-retries`, `--retry-delay`, `--channel-failure-threshold` for `braid send`
+- **Reconnect protocol**: Full `Reconnect` message exchange — sender detects all-channels-down, sends Reconnect to receiver, receiver opens new UDP sockets, sender resumes transfer
+- **Server retry**: `ControlServer::accept_with_retry()` for re-entering accept loop after completed sessions
+- **Worker health integration**: `UdpSendWorker` reports `WorkerResult` (success/failure) via health channel, `QueueManager` processes failures and marks dead workers
+- **LZ4 compression**: New `compress` module with `compress_lz4()`/`decompress_lz4()` via `lz4_flex` (pure Rust, zero C dependencies)
+- **Per-chunk compression flag**: `COMPRESSED_LZ4` flag in `ChunkHeader.flags` field for per-chunk compress/no-compress decision
+- **Auto-disable**: Incompressible data sent uncompressed (compressed size ≥ original → `COMPRESSION_NONE`)
+- **CRC on uncompressed data**: CRC computed before compression, verified after decompression — catches both network errors and decompression bugs
+- **Compression CLI flags**: `--compress-lz4` and `--compress-zstd` for `braid send`
+- **Compression negotiation**: Feature bits in `NegotiationConfig` for LZ4 and Zstd capability advertising
+- **Worker `channel_id` tracking**: `UdpSendWorker` now tracks its channel ID for health reporting
+- **QueueManager `last_chunk_id`**: Tracks last dispatched chunk ID for reconnect resume point
+
+### Changed
+
+- `BufferPool` internals: `Mutex<Vec<Vec<u8>>>` → `tokio::sync::Semaphore` + `Mutex<Vec<usize>>` free-list + `Vec<BytesMut>` storage
+- `PoolBuffer` replaces `BufferGuard`: zero-copy split (`split_to().freeze()`) instead of `to_vec()` copy
+- `ChunkSplitter::new()` now takes `pool: BufferPool` parameter
+- `FragmentReassembler::new()` now takes `pool: BufferPool` parameter
+- `UdpSendWorker::new()` now takes `channel_id: usize` as first parameter
+- `QueueManagerBuilder::build()` returns 3-tuple `(QueueManager, Vec<WorkerReceiver>, mpsc::Receiver<WorkerResult>)` instead of 2-tuple
+- Benchmarks updated for async `BufferPool::acquire()` API
+
+### Removed
+
+- Old `BufferGuard` and `get_buffer()` from `buffer/pool.rs`
+- `Deref`/`DerefMut` impls on buffer types
+- `legacy_buffers` storage in `PoolInner`
 
 ### Added
 

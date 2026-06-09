@@ -1,15 +1,17 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 
+use crate::buffer::pool::BufferPool;
+use crate::compress::compress_lz4;
 use crate::protocol::crc::{compute_chunk_crc, compute_fragment_crc};
-use crate::protocol::headers::{ChunkHeader, FragmentHeader};
+use crate::protocol::headers::{ChunkHeader, FragmentHeader, COMPRESSED_LZ4, COMPRESSION_NONE};
 
 /// A batch of fragments sent from the splitter to downstream consumers.
 /// EOS is signaled by dropping the sender / channel close.
-pub type FragmentOrEos = Vec<Vec<u8>>;
+pub type FragmentOrEos = Vec<Bytes>;
 
 /// Default number of fragments to batch per channel message.
 const DEFAULT_BATCH_SIZE: usize = 64;
@@ -42,6 +44,7 @@ pub struct ChunkSplitter {
     mtu: usize,
     next_chunk_id: AtomicU64,
     fragment_payload_size: usize,
+    pool: BufferPool,
 }
 
 impl ChunkSplitter {
@@ -50,7 +53,8 @@ impl ChunkSplitter {
     /// * `chunk_size` - Maximum payload bytes per chunk (before chunk header).
     /// * `mtu` - Maximum transmission unit in bytes. Fragment payloads are
     ///   sized to fit within this minus `FragmentHeader::LEN`.
-    pub fn new(chunk_size: usize, mtu: usize) -> Self {
+    /// * `pool` - Buffer pool to use for I/O buffers.
+    pub fn new(chunk_size: usize, mtu: usize, pool: BufferPool) -> Self {
         assert!(chunk_size > 0, "chunk_size must be positive");
         assert!(
             mtu > FragmentHeader::LEN,
@@ -68,6 +72,7 @@ impl ChunkSplitter {
             mtu,
             next_chunk_id: AtomicU64::new(0),
             fragment_payload_size,
+            pool,
         }
     }
 
@@ -107,7 +112,7 @@ impl ChunkSplitter {
     /// Returns an IO error if reading from the reader fails.
     pub async fn run<R>(
         &self,
-        tx: mpsc::Sender<Vec<Vec<u8>>>,
+        tx: mpsc::Sender<Vec<Bytes>>,
         pause_rx: Option<mpsc::Receiver<bool>>,
         reader: R,
     ) -> Result<(), std::io::Error>
@@ -115,12 +120,11 @@ impl ChunkSplitter {
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
         let mut reader = BufReader::new(reader);
-        // Pre-allocate read buffer and reuse it each iteration
-        let mut read_buf = vec![0u8; self.chunk_size];
+        let mut pool_read_buf = self.pool.acquire().await;
         // Pre-allocate chunk buffer and reuse it each iteration
         let mut chunk_buf = BytesMut::with_capacity(ChunkHeader::LEN + self.chunk_size);
         // Batch buffer: collect fragments and send in bulk
-        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+        let mut batch: Vec<Bytes> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
 
         // Unwrap pause_rx into a local mut variable for use in select!
         let mut pause_rx = pause_rx;
@@ -156,7 +160,7 @@ impl ChunkSplitter {
             // Use tokio::select! to read from stdin OR handle pause signals
             let bytes_read: usize;
             tokio::select! {
-                result = reader.read(&mut read_buf) => {
+                result = reader.read(&mut pool_read_buf.buffer[..self.chunk_size]) => {
                     let n = result?;
                     if n == 0 {
                         // EOF: flush remaining batch, then return.
@@ -189,27 +193,32 @@ impl ChunkSplitter {
             }
 
             let chunk_id = self.next_chunk_id() as u32;
-            let payload = &read_buf[..bytes_read];
+            let payload = &pool_read_buf.buffer[..bytes_read];
 
-            // Compute chunk CRC (covers sequence number + payload)
+            // Compute chunk CRC (covers sequence number + payload, always on uncompressed data)
             let chunk_crc = compute_chunk_crc(chunk_id as u64, payload);
 
-            // Build chunk header
-            let chunk_header = ChunkHeader::new(
-                0, // flags: none
-                bytes_read as u16,
-                chunk_id as u64,
-                chunk_crc,
-            );
+            // Compress payload with LZ4; use compressed if it's smaller
+            let (flags, wire_payload) = match compress_lz4(payload) {
+                Ok(compressed) if compressed.len() < payload.len() => (COMPRESSED_LZ4, compressed),
+                _ => {
+                    // Compression didn't help (or failed) — use original
+                    (COMPRESSION_NONE, payload.to_vec())
+                }
+            };
 
-            // Build chunk buffer: header + payload (reuse pre-allocated buffer)
+            // Build chunk header
+            let chunk_header =
+                ChunkHeader::new(flags, wire_payload.len() as u16, chunk_id as u64, chunk_crc);
+
+            // Build chunk buffer: header + wire payload (reuse pre-allocated buffer)
             chunk_buf.clear();
             chunk_header.write_to(&mut chunk_buf);
-            chunk_buf.extend_from_slice(payload);
+            chunk_buf.extend_from_slice(&wire_payload);
 
             // Split the chunk into fragments
             let total_fragments =
-                (ChunkHeader::LEN + bytes_read).div_ceil(self.fragment_payload_size);
+                (ChunkHeader::LEN + wire_payload.len()).div_ceil(self.fragment_payload_size);
 
             for fragment_index in 0..total_fragments {
                 let start = fragment_index * self.fragment_payload_size;
@@ -230,12 +239,11 @@ impl ChunkSplitter {
                 };
 
                 // Assemble the full fragment: header + payload
-                let mut fragment = Vec::with_capacity(FragmentHeader::LEN + fragment_payload.len());
+                let mut fragment = BytesMut::with_capacity(FragmentHeader::LEN + fragment_payload.len());
                 frag_header.write_to(&mut fragment);
                 fragment.extend_from_slice(fragment_payload);
 
-                // Move fragment into batch (no clone needed — fresh allocation)
-                batch.push(fragment);
+                batch.push(fragment.freeze());
 
                 // Send batch when full
                 if batch.len() >= DEFAULT_BATCH_SIZE {
@@ -255,7 +263,8 @@ mod tests {
 
     /// Helper: create a splitter with small values for testing.
     fn test_splitter(chunk_size: usize, mtu: usize) -> ChunkSplitter {
-        ChunkSplitter::new(chunk_size, mtu)
+        let pool = BufferPool::new(2, chunk_size.max(mtu));
+        ChunkSplitter::new(chunk_size, mtu, pool)
     }
 
     /// Helper: collect all fragments from a splitter run into a Vec.
@@ -406,19 +415,22 @@ mod tests {
     #[test]
     #[should_panic(expected = "chunk_size must be positive")]
     fn rejects_zero_chunk_size() {
-        ChunkSplitter::new(0, 1500);
+        let pool = crate::buffer::pool::BufferPool::new(2, 1500);
+        ChunkSplitter::new(0, 1500, pool);
     }
 
     #[test]
     #[should_panic(expected = "mtu must be larger than FragmentHeader::LEN")]
     fn rejects_mtu_too_small() {
-        ChunkSplitter::new(1024, FragmentHeader::LEN);
+        let pool = crate::buffer::pool::BufferPool::new(2, 1500);
+        ChunkSplitter::new(1024, FragmentHeader::LEN, pool);
     }
 
     #[test]
     fn fragment_payload_size_never_zero() {
         // MTU = FragmentHeader::LEN + 1 → fragment_payload_size = 1
-        let s = ChunkSplitter::new(1024, FragmentHeader::LEN + 1);
+        let pool = crate::buffer::pool::BufferPool::new(2, 1500);
+        let s = ChunkSplitter::new(1024, FragmentHeader::LEN + 1, pool);
         assert_eq!(s.fragment_payload_size(), 1);
     }
 
@@ -426,8 +438,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_produces_fragments_then_eos() {
-        let _s = ChunkSplitter::new(1024, 1500);
-        let (tx, mut rx) = mpsc::channel::<Vec<Vec<u8>>>(64);
+        let pool = crate::buffer::pool::BufferPool::new(2, 1500);
+        let _s = ChunkSplitter::new(1024, 1500, pool);
+        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(64);
 
         // Simulate a small input by directly constructing fragments
         // (same logic as run() would produce)
@@ -453,7 +466,7 @@ mod tests {
         fragment.extend_from_slice(&frag_header.to_bytes());
         fragment.extend_from_slice(&chunk_buf);
 
-        tx.send(vec![fragment]).await.unwrap();
+        tx.send(vec![Bytes::from(fragment)]).await.unwrap();
         drop(tx); // Drop tx to signal EOS
 
         let mut count = 0;
@@ -465,9 +478,10 @@ mod tests {
 
     #[tokio::test]
     async fn backpressure_blocks_when_channel_full() {
-        let _s = ChunkSplitter::new(1024, 1500);
+        let pool = crate::buffer::pool::BufferPool::new(2, 1500);
+        let _s = ChunkSplitter::new(1024, 1500, pool);
         // Use a tiny channel capacity to force backpressure
-        let (tx, mut rx) = mpsc::channel::<Vec<Vec<u8>>>(1);
+        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(1);
 
         // Fill the channel
         let payload = b"backpressure test";
@@ -492,7 +506,7 @@ mod tests {
         fragment.extend_from_slice(&frag_header.to_bytes());
         fragment.extend_from_slice(&chunk_buf);
 
-        let batch = vec![fragment.clone()];
+        let batch = vec![Bytes::from(fragment.clone())];
 
         // Send one batch (channel capacity is 1, so this should succeed)
         tx.send(batch).await.unwrap();
@@ -500,7 +514,7 @@ mod tests {
         // Spawn a task that tries to send another — it will block
         let tx2 = tx.clone();
         let handle = tokio::spawn(async move {
-            tx2.send(vec![fragment]).await.unwrap();
+            tx2.send(vec![Bytes::from(fragment)]).await.unwrap();
         });
 
         // Drain the channel
@@ -521,6 +535,67 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// Verifies that compressible data gets COMPRESSED_LZ4 flag and
+    /// incompressible data gets COMPRESSION_NONE flag.
+    #[test]
+    fn compressed_chunk_has_correct_flags() {
+        // Compressible: repeating data
+        let compressible_payload = vec![0xABu8; 4096];
+        let chunk_id = 0u32;
+        let chunk_crc = compute_chunk_crc(chunk_id as u64, &compressible_payload);
+
+        let (flags, wire_payload) = match compress_lz4(&compressible_payload) {
+            Ok(compressed) if compressed.len() < compressible_payload.len() => {
+                (COMPRESSED_LZ4, compressed)
+            }
+            _ => (COMPRESSION_NONE, compressible_payload.to_vec()),
+        };
+
+        assert_eq!(
+            flags, COMPRESSED_LZ4,
+            "repeating data should be compressible"
+        );
+        assert!(
+            wire_payload.len() < compressible_payload.len(),
+            "compressed size should be smaller"
+        );
+
+        // Incompressible: LCG pseudo-random data (no repeating patterns)
+        let mut rng_state = 12345u32;
+        let incompressible_payload: Vec<u8> = (0..4096)
+            .map(|_| {
+                rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+                (rng_state >> 16) as u8
+            })
+            .collect();
+        let chunk_crc2 = compute_chunk_crc(1u64, &incompressible_payload);
+
+        let (flags2, wire_payload2) = match compress_lz4(&incompressible_payload) {
+            Ok(compressed) if compressed.len() < incompressible_payload.len() => {
+                (COMPRESSED_LZ4, compressed)
+            }
+            _ => (COMPRESSION_NONE, incompressible_payload.to_vec()),
+        };
+
+        assert_eq!(
+            flags2, COMPRESSION_NONE,
+            "random-ish data should not be compressible"
+        );
+        assert_eq!(
+            wire_payload2.len(),
+            incompressible_payload.len(),
+            "should use original payload"
+        );
+
+        // Verify CRC is still valid on the original (uncompressed) payload
+        assert!(verify_chunk_crc(
+            chunk_id as u64,
+            &compressible_payload,
+            chunk_crc
+        ));
+        assert!(verify_chunk_crc(1u64, &incompressible_payload, chunk_crc2));
+    }
+
     // Re-import CRC verify functions for tests
     use crate::protocol::crc::{verify_chunk_crc, verify_fragment_crc};
 
@@ -531,8 +606,9 @@ mod tests {
     /// signal to stop reading stdin, then sends a resume signal to restart.
     #[tokio::test]
     async fn test_splitter_pause_resume() {
-        let splitter = ChunkSplitter::new(64, 1500);
-        let (fragment_tx, _fragment_rx) = mpsc::channel::<Vec<Vec<u8>>>(16);
+        let pool = crate::buffer::pool::BufferPool::new(2, 1500);
+        let splitter = ChunkSplitter::new(64, 1500, pool);
+        let (fragment_tx, _fragment_rx) = mpsc::channel::<Vec<Bytes>>(16);
         let (pause_tx, pause_rx) = mpsc::channel::<bool>(16);
 
         // Send pause signal BEFORE spawning so the splitter enters pause immediately
@@ -568,12 +644,13 @@ mod tests {
             .await
             .expect("open temp file");
 
-        let splitter = ChunkSplitter::new(64, 1500);
-        let (tx, mut rx) = mpsc::channel::<Vec<Vec<u8>>>(64);
+        let pool = crate::buffer::pool::BufferPool::new(2, 1500);
+        let splitter = ChunkSplitter::new(64, 1500, pool);
+        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(64);
 
         let handle = tokio::spawn(async move { splitter.run(tx, None, file).await });
 
-        let mut all_fragments: Vec<Vec<u8>> = Vec::new();
+        let mut all_fragments: Vec<Bytes> = Vec::new();
         while let Some(batch) = rx.recv().await {
             all_fragments.extend(batch);
         }

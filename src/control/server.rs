@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time;
+use tracing::warn;
 
 use crate::protocol::ControlMessage;
 
@@ -31,6 +32,12 @@ impl ControlServer {
         self.listener.local_addr()
     }
 
+    #[cfg(test)]
+    pub fn with_accept_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     pub async fn accept(&self) -> Result<ControlConnection> {
         let (stream, _) = time::timeout(self.timeout, self.listener.accept())
             .await
@@ -41,6 +48,39 @@ impl ControlServer {
             _heartbeat: self.heartbeat,
             last_activity: std::time::Instant::now(),
         })
+    }
+
+    /// Attempt to accept a connection with retries and exponential backoff.
+    ///
+    /// Tries `accept()` up to `max_retries` times. On timeout, waits with
+    /// exponential backoff (`delay` doubled each attempt, capped at 60s)
+    /// and retries. Logs each retry at `warn!` level.
+    ///
+    /// Returns `ControlError::Timeout` after all retries are exhausted.
+    pub async fn accept_with_retry(
+        &self,
+        max_retries: u32,
+        initial_delay: Duration,
+    ) -> Result<ControlConnection> {
+        let mut delay = initial_delay;
+        for attempt in 1..=max_retries {
+            match self.accept().await {
+                Ok(conn) => return Ok(conn),
+                Err(ControlError::Timeout) => {
+                    if attempt == max_retries {
+                        warn!("accept timed out after {max_retries} retries, giving up");
+                        return Err(ControlError::Timeout);
+                    }
+                    warn!(
+                        "accept timed out (attempt {attempt}/{max_retries}), retrying in {delay:?}"
+                    );
+                    time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(60));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(ControlError::Timeout)
     }
 }
 

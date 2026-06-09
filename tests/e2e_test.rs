@@ -600,9 +600,9 @@ async fn test_crc_integrity() {
     use braid::protocol::headers::{ChunkHeader, FragmentHeader};
     use bytes::BytesMut;
 
-    let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
     let mut reassembler =
-        braid::receiver::reassembly::FragmentReassembler::new(tx, 1024 * 1024, 60);
+        braid::receiver::reassembly::FragmentReassembler::new(tx, 1024 * 1024, 60, braid::buffer::pool::BufferPool::new(4, 65536));
 
     let chunk_data = b"chunk crc integrity test across fragments";
     let wrong_crc = 0xDEADBEEF;
@@ -633,7 +633,7 @@ async fn test_crc_integrity() {
         fragment.extend_from_slice(&fragment_header.to_bytes());
         fragment.extend_from_slice(fragment_payload);
 
-        let result = reassembler.add_fragment(fragment).await;
+        let result = reassembler.add_fragment(fragment.into()).await;
         if fragment_index + 1 == total_fragments {
             assert_eq!(result.unwrap_err(), "chunk CRC mismatch");
         } else {

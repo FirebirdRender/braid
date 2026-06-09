@@ -6,5 +6,5 @@ pub mod server;
 mod tests;
 
 pub use client::{ControlClient, ControlError};
-pub use negotiation::{ChannelInfo, NegotiationConfig, NegotiationResult};
+pub use negotiation::{open_udp_socket, ChannelInfo, NegotiationConfig, NegotiationResult};
 pub use server::{ControlConnection, ControlServer};

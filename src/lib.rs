@@ -1,5 +1,6 @@
 pub mod adaptive;
 pub mod buffer;
+pub mod compress;
 pub mod control;
 pub mod error;
 pub mod file_mode;

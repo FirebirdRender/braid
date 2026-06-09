@@ -160,13 +160,22 @@ The receiver:
 Usage: braid send [OPTIONS] --destination <DESTINATION>
 
 Options:
-      --destination <DESTINATION>  Destination address as IP:PORT
-      --chunk-size <CHUNK_SIZE>    Chunk size in bytes (0 = adaptive) [default: 0]
-      --channels <CHANNELS>        Number of parallel channels (0 = adaptive) [default: 0]
-      --mtu <MTU>                  MTU for fragment sizing [default: 1500]
-      --quiet                      Quiet mode: suppress progress output
-      --verbose                    Verbose mode: detailed progress output
-  -h, --help                       Print help
+  -d, --destination <DESTINATION>          Destination address as IP:PORT
+  -c, --chunk-size <CHUNK_SIZE>            Chunk size in bytes (0 = adaptive) [default: 0]
+      --channels <CHANNELS>                Number of parallel channels (0 = adaptive) [default: 0]
+      --mtu <MTU>                          MTU for fragment sizing [default: 1500]
+      --mode <MODE>                        Input mode: pipe or file [default: pipe]
+      --input <PATH>                       Input file path for file mode
+  -q, --quiet                              Quiet mode: suppress progress output
+  -v, --verbose                            Verbose mode: detailed progress output
+  -r, --max-rate <MAX_RATE>                Maximum send rate (0 = unlimited) [default: 0]
+      --compress-lz4                       Enable LZ4 compression
+      --compress-zstd                      Enable Zstd compression
+      --retry                              Retry connection on initial failure
+      --max-retries <MAX_RETRIES>          Maximum retry attempts [default: 3]
+      --retry-delay <RETRY_DELAY>          Initial retry delay in ms [default: 1000]
+      --channel-failure-threshold <N>      Consecutive failures before dead [default: 3]
+  -h, --help                               Print help
 ```
 
 ### `braid receive`
@@ -201,12 +210,14 @@ On loopback, larger MTUs (8800–65535) give the best throughput. On real networ
 BRAID achieves ~455 MiB/s on loopback at MTU 1500 with 4 parallel channels (Criterion benchmark: `pipeline/full/65535`). Performance scales with MTU size and channel count — at MTU 8800, e2e throughput reaches ~669 MB/s (6.6 Gbps).
 
 Key optimizations:
+- **Zero-copy buffer pool**: pre-allocated `BytesMut` pool with semaphore-based acquire/release eliminates hot-path allocations
 - **Zero-allocation fragment CRC**: chained `crc32fast::Hasher` avoids intermediate Vec
 - **Hash-sharded reassembly**: N parallel reassemblers distributed by `chunk_id % N`
 - **In-place header stripping**: `copy_within` + `truncate` instead of `to_vec()` copy
 - **Direct header serialization**: `write_to(&mut impl BufMut)` avoids `to_bytes()` allocation
 - **Bulk dispatch**: fragments batched per channel message (64 per batch)
 - **Adaptive chunk sizing**: chunk size negotiates with receiver for optimal fit
+- **LZ4 compression**: optional chunk-level compression with auto-disable for incompressible data
 
 ## Architecture
 
@@ -223,7 +234,8 @@ src/
 ├── sender/
 │   ├── splitter.rs        # ChunkSplitter: stdin → fragments
 │   ├── queue.rs           # QueueManager: LACP-like dispatch
-│   └── worker.rs          # UdpSendWorker: per-channel UDP sender
+│   ├── worker.rs          # UdpSendWorker: per-channel UDP sender
+│   └── health.rs          # ChannelHealth: per-channel failure tracking
 ├── receiver/
 │   ├── reassembly.rs      # FragmentReassembler: fragments → chunks
 │   ├── ordering.rs        # ChunkOrderer: sequence number ordering
@@ -239,6 +251,7 @@ src/
 │   ├── server.rs          # Control protocol server
 │   └── negotiation.rs     # Channel/chunk size negotiation
 ├── buffer/                # Buffer pool and ring buffer
+├── compress/              # LZ4 compression (compress_lz4, decompress_lz4)
 ├── flow/                  # Flow control (reactor, monitor)
 ├── progress/              # Progress reporting
 ├── shutdown/              # Graceful shutdown
@@ -246,7 +259,30 @@ src/
 └── error/                 # Error types
 ```
 
-## Protocol Details
+## v0.4.0 Features
+
+### Buffer Pool (zero-copy pipeline)
+
+v0.4.0 replaces all hot-path `Vec<u8>` allocations with `bytes::Bytes` backed by a pre-allocated buffer pool:
+
+- **Semaphore-based acquire/release**: `tokio::sync::Semaphore` controls access to a pool of pre-allocated `BytesMut` buffers
+- **PoolBuffer**: auto-returns to pool on drop, supports zero-copy `split_to().freeze()` instead of `to_vec()` copy
+- **`acquire_many(n)`**: batch allocate buffers for bulk operations
+- **Integrated everywhere**: UDP receive worker, fragment reassembly, and chunk splitter all use pool buffers
+
+### Connection Resilience
+
+- **`--retry` / `--max-retries` / `--retry-delay`**: Exponential backoff retry on TCP connection failure (doubles each attempt, capped at 60s)
+- **`--channel-failure-threshold`**: Per-channel health monitoring — workers report success/failure, dead channels trigger fragment redistribution
+- **Reconnect protocol**: When all UDP channels fail mid-transfer, sender sends `Reconnect` message over TCP control connection, receiver opens new UDP sockets, transfer resumes
+- **`accept_with_retry()`**: Receiver re-enters accept loop after completed sessions
+
+### LZ4 Compression
+
+- **`--compress-lz4`**: Enable LZ4 compression at the chunk level (before fragmentation)
+- **Auto-disable**: Incompressible data sent uncompressed automatically (per-chunk flag)
+- **CRC on uncompressed data**: CRCs computed on original data, verified after decompression — catches both network errors and decompression bugs
+- **Zero C dependencies**: `lz4_flex` is pure Rust
 
 ### Fragment Wire Format
 

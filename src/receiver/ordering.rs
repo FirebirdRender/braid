@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::Duration;
 
+use bytes::Bytes;
 use tracing::{debug, trace};
 
 use crate::protocol::headers::ChunkHeader;
@@ -87,7 +88,7 @@ impl ChunkOrderer {
     /// it is emitted anyway (best-effort) to prevent memory buildup.
     pub async fn run(
         &mut self,
-        mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        mut rx: tokio::sync::mpsc::Receiver<Bytes>,
         gap_timeout: Option<Duration>,
     ) {
         let mut ticker = gap_timeout.map(|d| tokio::time::interval(d));
@@ -151,16 +152,16 @@ impl ChunkOrderer {
             0
         };
 
-        let data = if payload.len() > ChunkHeader::LEN {
+        let data: Bytes = if payload.len() > ChunkHeader::LEN {
             let data_len = payload.len() - ChunkHeader::LEN;
             payload.copy_within(ChunkHeader::LEN.., 0);
             // SAFETY: data_len < original len, and we just copied those bytes to [0..data_len)
             unsafe {
                 payload.set_len(data_len);
             }
-            payload
+            Bytes::from(payload)
         } else {
-            Vec::new()
+            Bytes::new()
         };
 
         CommitGateInput {
@@ -190,14 +191,14 @@ impl ChunkOrderer {
         }
     }
 
-    pub async fn push_chunk(&mut self, payload: Vec<u8>) -> ChunkOrdererStats {
+    pub async fn push_chunk(&mut self, payload: Bytes) -> ChunkOrdererStats {
         let seq = parse_sequence_number(&payload);
 
         self.stats.chunks_received += 1;
 
         self.heap.push(Reverse(OrderedChunk {
             sequence_number: seq,
-            payload,
+            payload: payload.to_vec(),
         }));
 
         trace!(
@@ -227,7 +228,7 @@ impl ChunkOrderer {
             let Reverse(chunk) = self.heap.pop().unwrap();
             let seq = chunk.sequence_number;
 
-            let data = chunk.payload[ChunkHeader::LEN..].to_vec();
+            let data: Bytes = chunk.payload[ChunkHeader::LEN..].to_vec().into();
             let chunk_crc = if chunk.payload.len() >= ChunkHeader::LEN {
                 u32::from_be_bytes([
                     chunk.payload[12],
@@ -277,15 +278,15 @@ impl ChunkOrderer {
                 0
             };
 
-            let data = if payload.len() > ChunkHeader::LEN {
+            let data: Bytes = if payload.len() > ChunkHeader::LEN {
                 let data_len = payload.len() - ChunkHeader::LEN;
                 payload.copy_within(ChunkHeader::LEN.., 0);
                 unsafe {
                     payload.set_len(data_len);
                 }
-                payload
+                Bytes::from(payload)
             } else {
-                Vec::new()
+                Bytes::new()
             };
 
             let input = CommitGateInput {
@@ -343,17 +344,17 @@ mod tests {
 
     /// Build a complete chunk payload (ChunkHeader + data) with the given
     /// sequence number and data.
-    fn build_chunk(sequence_number: u64, data: &[u8]) -> Vec<u8> {
+    fn build_chunk(sequence_number: u64, data: &[u8]) -> Bytes {
         let chunk_crc = compute_chunk_crc(sequence_number, data);
         let header = ChunkHeader::new(0, data.len() as u16, sequence_number, chunk_crc);
         let mut buf = BytesMut::with_capacity(ChunkHeader::LEN + data.len());
         buf.extend_from_slice(&header.to_bytes());
         buf.extend_from_slice(data);
-        buf.to_vec()
+        Bytes::from(buf.to_vec())
     }
 
     /// Build chunks with consecutive sequence numbers starting from `start_seq`.
-    fn build_chunks(start_seq: u64, count: u64, data_prefix: u8) -> Vec<Vec<u8>> {
+    fn build_chunks(start_seq: u64, count: u64, data_prefix: u8) -> Vec<Bytes> {
         (0..count)
             .map(|i| {
                 let seq = start_seq + i;
@@ -536,7 +537,7 @@ mod tests {
     #[tokio::test]
     async fn run_loop_processes_all_chunks() {
         let (tx, rx) = mpsc::channel(16);
-        let (input_tx, input_rx) = mpsc::channel(16);
+        let (input_tx, input_rx) = mpsc::channel::<Bytes>(16);
 
         let mut orderer = ChunkOrderer::new(tx, 0);
 
@@ -565,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn run_loop_handles_out_of_order() {
         let (tx, rx) = mpsc::channel(16);
-        let (input_tx, input_rx) = mpsc::channel(16);
+        let (input_tx, input_rx) = mpsc::channel::<Bytes>(16);
 
         let mut orderer = ChunkOrderer::new(tx, 0);
 
@@ -595,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn run_loop_drains_heap_on_close() {
         let (tx, rx) = mpsc::channel(16);
-        let (input_tx, input_rx) = mpsc::channel(16);
+        let (input_tx, input_rx) = mpsc::channel::<Bytes>(16);
 
         let mut orderer = ChunkOrderer::new(tx, 0);
 

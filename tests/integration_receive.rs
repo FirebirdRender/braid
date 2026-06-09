@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use bytes::Bytes;
 use braid::buffer::pool::BufferPool;
 use braid::flow::ReceiverMonitor;
 use braid::progress::reporter::{ProgressReporter, ProgressVerbosity};
@@ -49,14 +50,15 @@ async fn test_shutdown_manager_subscribe() {
 #[tokio::test]
 async fn test_buffer_pool_creation() {
     let pool = BufferPool::new(10, 1024);
-    let guard = pool.get_buffer();
-    assert_eq!(guard.len(), 1024);
+    let guard = pool.acquire().await;
+
+    assert_eq!(guard.buffer.len(), 1024);
 }
 
 #[tokio::test]
 async fn test_fragment_reassembler_creation() {
-    let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-    let reassembler = FragmentReassembler::new(tx, 1024 * 1024, 60);
+    let (tx, _rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+    let reassembler = FragmentReassembler::new(tx, 1024 * 1024, 60, BufferPool::new(4, 65536));
     assert_eq!(reassembler.in_flight_count(), 0);
     assert_eq!(reassembler.inflight_bytes(), 0);
 }
@@ -100,10 +102,10 @@ async fn test_receiver_monitor_creation() {
 
 #[tokio::test]
 async fn test_reassembly_to_orderer_pipeline() {
-    let (reassembly_tx, mut reassembly_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (reassembly_tx, mut reassembly_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     let (orderer_tx, mut orderer_rx) = tokio::sync::mpsc::channel::<CommitGateInput>(16);
 
-    let mut reassembler = FragmentReassembler::new(reassembly_tx, 1024 * 1024, 60);
+    let mut reassembler = FragmentReassembler::new(reassembly_tx, 1024 * 1024, 60, BufferPool::new(4, 65536));
     let mut orderer = ChunkOrderer::new(orderer_tx, 0);
 
     use braid::protocol::crc::compute_chunk_crc;
@@ -130,7 +132,7 @@ async fn test_reassembly_to_orderer_pipeline() {
     fragment.extend_from_slice(&frag_header.to_bytes());
     fragment.extend_from_slice(&chunk_buf);
 
-    let completed = reassembler.add_fragment(fragment).await.unwrap();
+    let completed = reassembler.add_fragment(fragment.into()).await.unwrap();
     assert!(
         completed,
         "single-fragment chunk should complete immediately"
@@ -159,7 +161,7 @@ async fn test_orderer_to_commit_gate_pipeline() {
     let crc = compute_chunk_crc(42, data);
     orderer_tx
         .send(CommitGateInput {
-            data: data.to_vec(),
+            data: Bytes::copy_from_slice(b"ordered data"),
             sequence_number: 42,
             chunk_crc: crc,
         })
@@ -180,10 +182,10 @@ async fn test_orderer_to_commit_gate_pipeline() {
 
 #[tokio::test]
 async fn test_full_pipeline_reassembly_to_commit() {
-    let (reassembly_tx, mut reassembly_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (reassembly_tx, mut reassembly_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     let (orderer_tx, orderer_rx) = tokio::sync::mpsc::channel::<CommitGateInput>(16);
 
-    let mut reassembler = FragmentReassembler::new(reassembly_tx, 1024 * 1024, 60);
+    let mut reassembler = FragmentReassembler::new(reassembly_tx, 1024 * 1024, 60, BufferPool::new(4, 65536));
     let mut orderer = ChunkOrderer::new(orderer_tx, 0);
     let mut gate = CommitGate::new(orderer_rx);
 
@@ -219,7 +221,7 @@ async fn test_full_pipeline_reassembly_to_commit() {
         fragment.extend_from_slice(&frag_header.to_bytes());
         fragment.extend_from_slice(&chunk_buf);
 
-        let completed = reassembler.add_fragment(fragment).await.unwrap();
+        let completed = reassembler.add_fragment(fragment.into()).await.unwrap();
         assert!(completed);
 
         let reassembled = reassembly_rx.recv().await.unwrap();
@@ -332,7 +334,7 @@ async fn test_commit_gate_stats_after_normal_run() {
 
     // Send a valid chunk then close the channel
     let input = CommitGateInput {
-        data: b"hello world".to_vec(),
+        data: Bytes::copy_from_slice(b"hello world"),
         sequence_number: 0,
         chunk_crc: 0,
     };

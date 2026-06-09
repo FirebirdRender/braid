@@ -276,6 +276,8 @@ async fn setup_negotiation(channel_count: u8) -> (ControlClient, Vec<ChannelInfo
         min_chunk: 10,
         max_chunk: 20,
         mtu: 14,
+        compression_lz4: false,
+        compression_zstd: false,
     };
 
     let sender_result = negotiate(&mut client, config).await.unwrap();
@@ -329,6 +331,8 @@ async fn test_negotiation_zero_channels_fails() {
         min_chunk: 10,
         max_chunk: 20,
         mtu: 14,
+        compression_lz4: false,
+        compression_zstd: false,
     };
 
     let sender_result = negotiate(&mut client, config).await;
@@ -362,6 +366,8 @@ async fn test_negotiation_features_round_trip() {
         min_chunk: 10,
         max_chunk: 20,
         mtu: 14,
+        compression_lz4: false,
+        compression_zstd: false,
     };
     let features = config.to_features();
     let decoded = NegotiationConfig::from_features(features);
@@ -369,6 +375,8 @@ async fn test_negotiation_features_round_trip() {
     assert_eq!(decoded.min_chunk, 10);
     assert_eq!(decoded.max_chunk, 20);
     assert_eq!(decoded.mtu, 14);
+    assert!(!decoded.compression_lz4);
+    assert!(!decoded.compression_zstd);
 }
 
 #[tokio::test]
@@ -378,6 +386,8 @@ async fn test_negotiation_features_zero_values() {
         min_chunk: 0,
         max_chunk: 0,
         mtu: 0,
+        compression_lz4: false,
+        compression_zstd: false,
     };
     let features = config.to_features();
     let decoded = NegotiationConfig::from_features(features);
@@ -819,6 +829,8 @@ async fn test_negotiation_receiver_rejects() {
         min_chunk: 10,
         max_chunk: 20,
         mtu: 14,
+        compression_lz4: false,
+        compression_zstd: false,
     };
     let sender_result = negotiate(&mut client, config).await;
     assert!(

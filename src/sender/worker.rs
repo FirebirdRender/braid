@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -36,6 +37,15 @@ impl UdpSendWorkerStats {
     }
 }
 
+/// Result type reported by a worker to the queue manager's health monitoring loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerResult {
+    /// The worker finished normally (channel closed).
+    Done,
+    /// The worker encountered a send error.
+    Failed,
+}
+
 /// A single UDP send worker that owns a `tokio::net::UdpSocket`.
 ///
 /// Each worker binds to its assigned local port and sends fragments received
@@ -51,6 +61,9 @@ pub struct UdpSendWorker {
     send_timeout: Duration,
     /// Shared statistics.
     stats: Arc<UdpSendWorkerStats>,
+    /// Channel to report worker lifecycle results (e.g. send failures) to
+    /// the queue manager's health monitoring loop.
+    health_tx: Option<mpsc::Sender<WorkerResult>>,
 }
 
 impl UdpSendWorker {
@@ -63,6 +76,7 @@ impl UdpSendWorker {
         so_sndbuf: usize,
         send_timeout: Duration,
         stats: Arc<UdpSendWorkerStats>,
+        health_tx: Option<mpsc::Sender<WorkerResult>>,
     ) -> Self {
         Self {
             local_port,
@@ -70,6 +84,7 @@ impl UdpSendWorker {
             so_sndbuf,
             send_timeout,
             stats,
+            health_tx,
         }
     }
 
@@ -126,7 +141,7 @@ impl UdpSendWorker {
     /// Each datagram send is bounded by `send_timeout`. On timeout or socket
     /// error, the error is logged to stderr and the error counter is incremented,
     /// but the worker continues processing subsequent fragments.
-    pub async fn run(&self, socket: UdpSocket, mut rx: mpsc::Receiver<Vec<u8>>) {
+    pub async fn run(&self, socket: UdpSocket, mut rx: mpsc::Receiver<Bytes>) {
         while let Some(data) = rx.recv().await {
             let result = self.send_with_timeout(&socket, &data).await;
 
@@ -137,8 +152,14 @@ impl UdpSendWorker {
                 Err(e) => {
                     self.stats.record_error();
                     eprintln!("[UdpSendWorker:{}] send error: {}", self.local_port, e);
+                    if let Some(ref tx) = self.health_tx {
+                        let _ = tx.try_send(WorkerResult::Failed);
+                    }
                 }
             }
+        }
+        if let Some(ref tx) = self.health_tx {
+            let _ = tx.try_send(WorkerResult::Done);
         }
     }
 
@@ -248,6 +269,7 @@ mod tests {
             65536, // small buffer for tests
             Duration::from_secs(1),
             stats.clone(),
+            None, // no health reporting in tests
         );
         (worker, stats)
     }
@@ -263,7 +285,7 @@ mod tests {
         let (worker, stats) = make_worker(0, listen_addr);
         let socket = worker.bind().await.unwrap();
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
 
         // Spawn the worker
         let handle = tokio::spawn(async move {
@@ -271,7 +293,7 @@ mod tests {
         });
 
         // Send a test fragment
-        let fragment_data: Vec<u8> = vec![0x50, 0x00, 0x00, 0x0A, 0x01, 0x02, 0x03, 0x04];
+        let fragment_data: Bytes = Bytes::from(vec![0x50, 0x00, 0x00, 0x0A, 0x01, 0x02, 0x03, 0x04]);
         tx.send(fragment_data.clone()).await.unwrap();
         drop(tx);
 
@@ -299,14 +321,14 @@ mod tests {
         let (worker, stats) = make_worker(0, listen_addr);
         let socket = worker.bind().await.unwrap();
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
 
         let handle = tokio::spawn(async move {
             worker.run(socket, rx).await;
         });
 
         // Send multiple fragments
-        let fragments: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8; 100]).collect();
+        let fragments: Vec<Bytes> = (0..5).map(|i| Bytes::from(vec![i as u8; 100])).collect();
 
         for frag in &fragments {
             tx.send(frag.clone()).await.unwrap();
@@ -339,7 +361,7 @@ mod tests {
         let (worker, _stats) = make_worker(0, listen_addr);
         let socket = worker.bind().await.unwrap();
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
         drop(tx); // Drop tx immediately so rx.recv() returns None
 
         let handle = tokio::spawn(async move {
@@ -362,14 +384,14 @@ mod tests {
         let (worker, stats) = make_worker(0, unreachable_addr);
         let socket = worker.bind().await.unwrap();
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
 
         let handle = tokio::spawn(async move {
             worker.run(socket, rx).await;
         });
 
         // Send a fragment to the unreachable address
-        let fragment_data: Vec<u8> = vec![0x50, 0x00, 0x00, 0x0A, 0x01, 0x02, 0x03, 0x04];
+        let fragment_data: Bytes = Bytes::from(vec![0x50, 0x00, 0x00, 0x0A, 0x01, 0x02, 0x03, 0x04]);
         tx.send(fragment_data).await.unwrap();
         drop(tx);
 
@@ -407,16 +429,16 @@ mod tests {
 
         let stats = Arc::new(UdpSendWorkerStats::default());
         let worker =
-            UdpSendWorker::new(0, listen_addr, 65536, Duration::from_secs(1), stats.clone());
+            UdpSendWorker::new(0, listen_addr, 65536, Duration::from_secs(1), stats.clone(), None);
         let socket = worker.bind().await.unwrap();
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
 
         let handle = tokio::spawn(async move {
             worker.run(socket, rx).await;
         });
 
-        tx.send(vec![0u8; 50]).await.unwrap();
+        tx.send(Bytes::from(vec![0u8; 50])).await.unwrap();
         drop(tx);
 
         handle.await.unwrap();
@@ -439,6 +461,7 @@ mod tests {
             65536,
             Duration::from_millis(1), // very short timeout
             stats.clone(),
+            None,
         );
         let socket = worker.bind().await.unwrap();
 

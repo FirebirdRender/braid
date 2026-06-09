@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
 
@@ -31,6 +32,7 @@ pub struct BraidReceive {
     bind: SocketAddr,
     output: Option<PathBuf>,
     buffer_size: usize,
+    #[allow(dead_code)]
     mtu: usize,
     verbosity: ProgressVerbosity,
     mode: Mode,
@@ -108,11 +110,17 @@ impl BraidReceive {
             .map_err(|e| format!("control accept failed: {e}"))?;
         info!("sender connected on control channel");
 
-        let (_config, udp_sockets, result) = accept_negotiation(&mut conn)
+        let (config, udp_sockets, result) = accept_negotiation(&mut conn)
             .await
             .map_err(|e| format!("negotiation failed: {e}"))?;
         let channels = result.channels;
         info!("negotiated {} channels", channels.len());
+        if config.compression_lz4 || config.compression_zstd {
+            info!(
+                "sender supports compression: lz4={}, zstd={}",
+                config.compression_lz4, config.compression_zstd
+            );
+        }
 
         // ─── File mode setup (after negotiation, before pipeline) ──────────
         let (file_mode_state, mut conn_opt) = if self.mode == Mode::File {
@@ -163,7 +171,7 @@ impl BraidReceive {
             (None, Some(conn))
         };
 
-        let (reassembly_tx, reassembly_rx) = mpsc::channel::<Vec<u8>>(DEFAULT_CHANNEL_CAPACITY);
+        let (reassembly_tx, reassembly_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CAPACITY);
         let (orderer_tx, orderer_rx) = mpsc::channel::<CommitGateInput>(DEFAULT_CHANNEL_CAPACITY);
         let (control_tx, mut control_rx) =
             mpsc::channel::<braid::protocol::ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
@@ -188,8 +196,9 @@ impl BraidReceive {
         // Used after completion to detect write errors in file mode.
         let commit_gate_stats = commit_gate.stats_arc();
 
+        let monitor_pool = buffer_pool.clone();
         let mut monitor = ReceiverMonitor::new(
-            buffer_pool,
+            monitor_pool,
             max_inflight,
             control_tx,
             DEFAULT_STATUS_INTERVAL,
@@ -206,10 +215,10 @@ impl BraidReceive {
         // N fragment channels: each UDP worker routes fragments to the correct
         // reassembler by chunk_id % N. This distributes CRC+reassembly across
         // cores regardless of which worker receives which packet.
-        let mut fragment_txs: Vec<mpsc::Sender<Vec<u8>>> = Vec::with_capacity(num_workers);
-        let mut fragment_rxs: Vec<mpsc::Receiver<Vec<u8>>> = Vec::with_capacity(num_workers);
+        let mut fragment_txs: Vec<mpsc::Sender<Bytes>> = Vec::with_capacity(num_workers);
+        let mut fragment_rxs: Vec<mpsc::Receiver<Bytes>> = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            let (tx, rx) = mpsc::channel::<Vec<u8>>(DEFAULT_CHANNEL_CAPACITY);
+            let (tx, rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CAPACITY);
             fragment_txs.push(tx);
             fragment_rxs.push(rx);
         }
@@ -218,11 +227,10 @@ impl BraidReceive {
         for (i, socket) in udp_sockets.into_iter().enumerate() {
             let sd = shutdown.clone();
             let txs = fragment_txs.clone();
-            let mtu = self.mtu;
+            let pool = buffer_pool.clone();
             let nw = num_workers;
             let handle = tokio::spawn(async move {
                 info!("UDP receive worker {} started", i);
-                let mut buf = vec![0u8; mtu];
                 let mut consecutive_timeouts = 0;
                 const MAX_CONSECUTIVE_TIMEOUTS: u32 = 10;
                 loop {
@@ -230,9 +238,13 @@ impl BraidReceive {
                         break;
                     }
 
-                    let result =
-                        tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
-                            .await;
+                    let mut pool_buf = pool.acquire().await;
+
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        socket.recv_from(&mut *pool_buf.buffer),
+                    )
+                    .await;
 
                     match result {
                         Ok(Ok((n, _src))) => {
@@ -242,15 +254,25 @@ impl BraidReceive {
                                 continue;
                             }
                             if !verify_fragment_crc(
-                                &buf[FragmentHeader::LEN..n],
-                                u32::from_be_bytes([buf[10], buf[11], buf[12], buf[13]]),
+                                &pool_buf.buffer[FragmentHeader::LEN..n],
+                                u32::from_be_bytes([
+                                    pool_buf.buffer[10],
+                                    pool_buf.buffer[11],
+                                    pool_buf.buffer[12],
+                                    pool_buf.buffer[13],
+                                ]),
                             ) {
                                 warn!("fragment CRC mismatch on worker {}, dropping", i);
                                 continue;
                             }
-                            let chunk_id = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                            let chunk_id = u32::from_be_bytes([
+                                pool_buf.buffer[0],
+                                pool_buf.buffer[1],
+                                pool_buf.buffer[2],
+                                pool_buf.buffer[3],
+                            ]);
                             let shard = (chunk_id as usize) % nw;
-                            let fragment = buf[..n].to_vec();
+                            let fragment = pool_buf.split_to(n).freeze();
                             if txs[shard].send(fragment).await.is_err() {
                                 info!("fragment channel {} closed, stopping worker {}", shard, i);
                                 break;
@@ -280,9 +302,8 @@ impl BraidReceive {
             });
             worker_handles.push(handle);
         }
-        // Drop all sender halves so reassembler tasks see channel close when
-        // no workers remain holding a clone.
-        drop(fragment_txs);
+        // fragment_txs are cloned into each worker task.
+        // The original will be dropped after the pipeline completes (or on reconnect).
 
         // Start N independent reassemblers, one per shard.
         // Each processes fragments for chunk_id % shard_index chunks.
@@ -291,7 +312,7 @@ impl BraidReceive {
         for (i, rx) in fragment_rxs.into_iter().enumerate() {
             let tx = reassembly_tx.clone();
             let mut reassembler =
-                FragmentReassembler::new(tx, max_inflight, DEFAULT_CHUNK_TIMEOUT_SECS);
+                FragmentReassembler::new(tx, max_inflight, DEFAULT_CHUNK_TIMEOUT_SECS, buffer_pool.clone());
             let handle = tokio::spawn(async move {
                 info!("fragment reassembler {} started", i);
                 let mut rx = rx;
@@ -343,6 +364,15 @@ impl BraidReceive {
             }
         });
 
+        // Reconnect trigger channel + outbound relay channel.
+        // When the control forward loop receives a Reconnect, it sends it here.
+        // When the reconnect handler needs to send Ack/ChannelOpened, it sends
+        // via reconnect_out_tx which the forward loop relays on the TCP connection.
+        let (reconnect_tx, mut reconnect_rx) =
+            mpsc::channel::<ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
+        let (reconnect_out_tx, mut reconnect_out_rx) =
+            mpsc::channel::<ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
+
         // Forward: bidirectional TCP forwarding over the control connection.
         // In file mode, conn stays in the main scope for post-EOS FileComplete.
         // In pipe mode, conn moves into this background task.
@@ -352,9 +382,23 @@ impl BraidReceive {
             let mut c = conn_opt
                 .take()
                 .expect("conn should be present in pipe mode");
+            let reconnect_tx = reconnect_tx.clone();
             Some(tokio::spawn(async move {
                 loop {
                     tokio::select! {
+                        biased;
+
+                        msg = reconnect_out_rx.recv() => {
+                            match msg {
+                                Some(msg) => {
+                                    if let Err(e) = c.send_message(&msg).await {
+                                        warn!("failed to send reconnect control message: {e}");
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
                         msg = queue_status_rx.recv() => {
                             match msg {
                                 Some(msg) => {
@@ -369,12 +413,12 @@ impl BraidReceive {
                         result = c.recv_message() => {
                             match result {
                                 Ok(ControlMessage::FileStart { .. }) => {
-                                    // Pipe mode does not expect FileStart. The sender
-                                    // should not send it unless file mode was negotiated.
-                                    // If it arrives, the receiver is being used in the
-                                    // wrong mode — abort immediately.
                                     warn!("received FileStart in pipe mode, ignoring");
                                     std::process::exit(1);
+                                }
+                                Ok(msg @ ControlMessage::Reconnect { .. }) => {
+                                    info!("control forward: received Reconnect, forwarding to handler");
+                                    let _ = reconnect_tx.send(msg).await;
                                 }
                                 Ok(msg) => {
                                     trace!("received control message: {msg:?}");
@@ -408,10 +452,28 @@ impl BraidReceive {
             info!("progress reporter finished");
         });
 
-        // Wait for all reassemblers to finish (EOS from sender) or timeout.
-        // We use a polling loop with shutdown check to avoid depending on the
-        // signal handler task being polled by a saturated runtime.
+        // Wait for all reassemblers to finish (EOS from sender) or a Reconnect
+        // message from the sender.
+        let mut need_reconnect = false;
         loop {
+            match tokio::time::timeout(Duration::from_millis(100), reconnect_rx.recv()).await {
+                Ok(Some(ControlMessage::Reconnect { last_sequence_number })) => {
+                    info!(
+                        "received Reconnect: last_sequence_number={}",
+                        last_sequence_number
+                    );
+                    need_reconnect = true;
+                    break;
+                }
+                Ok(Some(_)) => {
+                    trace!("ignored non-Reconnect message on reconnect channel");
+                }
+                Ok(None) => {
+                    trace!("reconnect channel closed");
+                }
+                Err(_) => {}
+            }
+
             let mut all_done = true;
             for handle in &reassembler_handles {
                 if !handle.is_finished() {
@@ -428,13 +490,142 @@ impl BraidReceive {
                 info!("reassemblers interrupted by shutdown signal");
                 break;
             }
-
-            tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
-        // Drop the original reassembly_tx sender so the orderer's receiver
-        // sees channel close. Without this, the orderer blocks forever on
-        // rx.recv() because the main scope still holds a live sender.
+        if need_reconnect {
+            info!("reconnect: opening new UDP sockets");
+
+            let num_new = worker_handles.len();
+            let mut new_udp_sockets = Vec::with_capacity(num_new);
+            let mut new_channel_infos = Vec::with_capacity(num_new);
+            for channel_id in 0..num_new as u16 {
+                match braid::control::negotiation::open_udp_socket().await {
+                    Ok(socket) => {
+                        let port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                        info!(
+                            "reconnect: opened new UDP socket channel_id={}, port={}",
+                            channel_id, port
+                        );
+                        new_udp_sockets.push(socket);
+                        new_channel_infos.push((channel_id, port));
+                    }
+                    Err(e) => {
+                        warn!("reconnect: failed to open UDP socket {}: {}", channel_id, e);
+                    }
+                }
+            }
+
+            let ack_seq = new_channel_infos.first().map(|(_, p)| *p as u64).unwrap_or(0);
+
+            info!("reconnect: sending Ack");
+            let _ = reconnect_out_tx
+                .send(ControlMessage::Ack {
+                    sequence_number: ack_seq,
+                })
+                .await;
+
+            for (channel_id, port) in &new_channel_infos {
+                let msg = ControlMessage::ChannelOpened {
+                    channel_id: *channel_id,
+                    port: *port,
+                };
+                let _ = reconnect_out_tx.send(msg).await;
+            }
+
+            // Start new UDP workers routing through the same fragment channels.
+            let mut new_worker_handles = Vec::with_capacity(new_udp_sockets.len());
+            for (i, socket) in new_udp_sockets.into_iter().enumerate() {
+                let sd = shutdown.clone();
+                let txs = fragment_txs.clone();
+                let pool = buffer_pool.clone();
+                let nw = num_new;
+                let handle = tokio::spawn(async move {
+                    info!("reconnect UDP receive worker {} started", i);
+                    let mut consecutive_timeouts = 0;
+                    const MAX_CONSECUTIVE_TIMEOUTS: u32 = 10;
+                    loop {
+                        if sd.is_shutting_down() {
+                            break;
+                        }
+                        let mut pool_buf = pool.acquire().await;
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(1),
+                            socket.recv_from(&mut *pool_buf.buffer),
+                        )
+                        .await;
+                        match result {
+                            Ok(Ok((n, _src))) => {
+                                consecutive_timeouts = 0;
+                                if n < FragmentHeader::LEN {
+                                    continue;
+                                }
+                                if !verify_fragment_crc(
+                                    &pool_buf.buffer[FragmentHeader::LEN..n],
+                                    u32::from_be_bytes([
+                                        pool_buf.buffer[10],
+                                        pool_buf.buffer[11],
+                                        pool_buf.buffer[12],
+                                        pool_buf.buffer[13],
+                                    ]),
+                                ) {
+                                    continue;
+                                }
+                                let chunk_id = u32::from_be_bytes([
+                                    pool_buf.buffer[0],
+                                    pool_buf.buffer[1],
+                                    pool_buf.buffer[2],
+                                    pool_buf.buffer[3],
+                                ]);
+                                let shard = (chunk_id as usize) % nw;
+                                let fragment = pool_buf.split_to(n).freeze();
+                                if txs[shard].send(fragment).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                if sd.is_shutting_down() {
+                                    break;
+                                }
+                                warn!("reconnect UDP recv error on worker {}: {}", i, e);
+                                break;
+                            }
+                            Err(_) => {
+                                consecutive_timeouts += 1;
+                                if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    info!("reconnect UDP receive worker {} finished", i);
+                });
+                new_worker_handles.push(handle);
+            }
+
+            worker_handles = new_worker_handles;
+
+            loop {
+                let mut all_done = true;
+                for handle in &reassembler_handles {
+                    if !handle.is_finished() {
+                        all_done = false;
+                        break;
+                    }
+                }
+                if all_done {
+                    info!("reconnect: all reassemblers completed");
+                    break;
+                }
+                if shutdown.is_shutting_down() {
+                    info!("reconnect: reassemblers interrupted by shutdown signal");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+
+        // Drop fragment_txs and reassembly_tx so the orderer sees channel close.
+        drop(fragment_txs);
         drop(reassembly_tx);
 
         // Await orderer and commit gate with generous timeouts.
@@ -629,27 +820,31 @@ mod tests {
     #[test]
     fn buffer_pool_creation() {
         let pool = BufferPool::new(10, 1024);
-        let guard = pool.get_buffer();
-        assert_eq!(guard.len(), 1024);
+        let guard = pool.acquire();
+        let guard = tokio::runtime::Runtime::new().unwrap().block_on(guard);
+        assert_eq!(guard.buffer.len(), 1024);
     }
 
     #[test]
     fn buffer_pool_reuses_buffers() {
         let pool = BufferPool::new(1, 8);
         {
-            let mut guard = pool.get_buffer();
-            guard[0] = 42;
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let mut guard = rt.block_on(pool.acquire());
+            guard.buffer[0] = 42;
         }
-        let guard = pool.get_buffer();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let guard = rt.block_on(pool.acquire());
         // After return to pool, buffer is cleared and resized
-        assert_eq!(guard.len(), 8);
-        assert_eq!(guard[0], 0);
+        assert_eq!(guard.buffer.len(), 8);
+        assert_eq!(guard.buffer[0], 0);
     }
 
     #[test]
     fn fragment_reassembler_creation() {
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(16);
-        let reassembler = FragmentReassembler::new(tx, 1024 * 1024, 60);
+        let (tx, _rx) = mpsc::channel::<Bytes>(16);
+        let pool = braid::buffer::pool::BufferPool::new(4, 65536);
+        let reassembler = FragmentReassembler::new(tx, 1024 * 1024, 60, pool);
         assert_eq!(reassembler.in_flight_count(), 0);
         assert_eq!(reassembler.inflight_bytes(), 0);
     }

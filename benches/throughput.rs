@@ -15,6 +15,7 @@
 use std::hint::black_box;
 use std::time::Duration;
 
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use braid::buffer::{BufferPool, RingBuffer};
@@ -247,10 +248,16 @@ fn bench_reassembly(c: &mut Criterion) {
             &fragments,
             |b, frags| {
                 b.iter(|| {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
                     let (tx, _rx) = tokio::sync::mpsc::channel(16);
-                    let mut reassembler = FragmentReassembler::new(tx, 10 * 1024 * 1024, 60);
+                    let pool = BufferPool::new(128, 65536);
+                    let mut reassembler = FragmentReassembler::new(tx, 10 * 1024 * 1024, 60, pool);
                     for frag in frags {
-                        let completed = reassembler.add_fragment(black_box(frag.clone())).unwrap();
+                        let completed = rt
+                            .block_on(reassembler.add_fragment(black_box(Bytes::from(
+                                frag.clone(),
+                            ))))
+                            .unwrap();
                         if completed {
                             break;
                         }
@@ -303,10 +310,14 @@ fn bench_reassembly_out_of_order(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(chunk_size as u64));
     group.bench_function("65535B_reversed", |b| {
         b.iter(|| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
             let (tx, _rx) = tokio::sync::mpsc::channel(16);
-            let mut reassembler = FragmentReassembler::new(tx, 10 * 1024 * 1024, 60);
+            let pool = BufferPool::new(128, 65536);
+            let mut reassembler = FragmentReassembler::new(tx, 10 * 1024 * 1024, 60, pool);
             for frag in &fragments {
-                let completed = reassembler.add_fragment(black_box(frag.clone())).unwrap();
+                let completed = rt
+                    .block_on(reassembler.add_fragment(black_box(Bytes::from(frag.clone()))))
+                    .unwrap();
                 if completed {
                     break;
                 }
@@ -331,8 +342,9 @@ fn bench_buffer_pool_acquire_release(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(buf_size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(buf_size), &pool, |b, p| {
             b.iter(|| {
-                let guard = p.get_buffer();
-                black_box(&*guard);
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let guard = rt.block_on(p.acquire());
+                black_box(guard.buffer[0]);
                 drop(guard);
             });
         });
@@ -359,10 +371,11 @@ fn bench_buffer_pool_contention(c: &mut Criterion) {
                     for _ in 0..n {
                         let p = Arc::clone(&pool);
                         handles.push(thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
                             for _ in 0..1000 {
-                                let guard = p.get_buffer();
+                                let guard = rt.block_on(p.acquire());
                                 // Touch a byte to force actual memory access
-                                let _byte = black_box(guard[0]);
+                                let _byte = black_box(guard.buffer[0]);
                                 drop(guard);
                             }
                         }));
@@ -500,11 +513,16 @@ fn bench_full_pipeline(c: &mut Criterion) {
                 b.iter(|| {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-                    let mut reassembler = FragmentReassembler::new(tx, 10 * 1024 * 1024, 60);
+                    let pool = BufferPool::new(256, 65536);
+                    let mut reassembler =
+                        FragmentReassembler::new(tx, 10 * 1024 * 1024, 60, pool);
 
                     let mut total_reassembled = 0usize;
                     for frag in frags {
-                        if let Ok(true) = reassembler.add_fragment(black_box(frag.clone())) {
+                        let frag_bytes = Bytes::from(frag.clone());
+                        if let Ok(true) = rt
+                            .block_on(reassembler.add_fragment(black_box(frag_bytes)))
+                        {
                             // Drain the emitted chunk
                             let _ = rx.try_recv().map(|chunk| {
                                 total_reassembled += chunk.len();
@@ -515,8 +533,6 @@ fn bench_full_pipeline(c: &mut Criterion) {
                     while let Ok(chunk) = rx.try_recv() {
                         total_reassembled += chunk.len();
                     }
-                    // Run the tokio reactor to process any pending sends
-                    rt.block_on(async {});
                     black_box(total_reassembled);
                 });
             },

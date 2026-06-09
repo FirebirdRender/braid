@@ -1,90 +1,116 @@
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytes::BytesMut;
+use tokio::sync::Semaphore;
+
+#[derive(Clone)]
 pub struct BufferPool {
     inner: Arc<PoolInner>,
 }
 
 struct PoolInner {
-    buffers: Mutex<Vec<Vec<u8>>>,
+    storage: Vec<BytesMut>,
+    free_list: Mutex<Vec<usize>>,
+    semaphore: Semaphore,
     buffer_size: usize,
-    /// Number of buffers currently checked out (in use).
-    in_use: AtomicUsize,
-    /// Total number of buffers allocated (initial count).
     total_buffers: usize,
 }
 
-pub struct BufferGuard {
-    buffer: Option<Vec<u8>>,
+pub struct PoolBuffer {
+    pub buffer: BytesMut,
+    pub index: usize,
     pool: Arc<PoolInner>,
+}
+
+impl PoolBuffer {
+    pub fn split_to(&mut self, n: usize) -> BytesMut {
+        self.buffer.split_to(n)
+    }
+    pub fn as_bytes_mut(&mut self) -> &mut BytesMut {
+        &mut self.buffer
+    }
+}
+
+impl Drop for PoolBuffer {
+    fn drop(&mut self) {
+        self.buffer.resize(self.pool.buffer_size, 0);
+        let mut free_list = self.pool.free_list.lock().unwrap();
+        free_list.push(self.index);
+        self.pool.semaphore.add_permits(1);
+    }
 }
 
 impl BufferPool {
     pub fn new(num_buffers: usize, buffer_size: usize) -> Self {
-        let mut buffers = Vec::with_capacity(num_buffers);
-        for _ in 0..num_buffers {
-            buffers.push(vec![0u8; buffer_size]);
+        let mut storage = Vec::with_capacity(num_buffers);
+        let mut free_list = Vec::with_capacity(num_buffers);
+        for i in 0..num_buffers {
+            storage.push(BytesMut::zeroed(buffer_size));
+            free_list.push(i);
         }
-
         Self {
             inner: Arc::new(PoolInner {
-                buffers: Mutex::new(buffers),
+                storage,
+                free_list: Mutex::new(free_list),
+                semaphore: Semaphore::new(num_buffers),
                 buffer_size,
-                in_use: AtomicUsize::new(0),
                 total_buffers: num_buffers,
             }),
         }
     }
 
-    pub fn get_buffer(&self) -> BufferGuard {
-        let mut buffers = self.inner.buffers.lock().unwrap();
-        let buffer = buffers
-            .pop()
-            .unwrap_or_else(|| vec![0u8; self.inner.buffer_size]);
-        self.inner.in_use.fetch_add(1, Ordering::Relaxed);
-        BufferGuard {
-            buffer: Some(buffer),
+    pub async fn acquire(&self) -> PoolBuffer {
+        let permit = self
+            .inner
+            .semaphore
+            .acquire()
+            .await
+            .expect("semaphore closed");
+        let index = {
+            let mut free_list = self.inner.free_list.lock().unwrap();
+            free_list.pop().expect("free-list empty despite permit")
+        };
+        let buffer = self.inner.storage[index].clone();
+        permit.forget();
+        PoolBuffer {
+            buffer,
+            index,
             pool: Arc::clone(&self.inner),
         }
     }
 
-    /// Returns the number of buffers currently checked out (in use).
-    pub fn used_count(&self) -> usize {
-        self.inner.in_use.load(Ordering::Relaxed)
+    pub async fn acquire_many(&self, n: usize) -> Vec<PoolBuffer> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let permit = self
+            .inner
+            .semaphore
+            .acquire_many(n as u32)
+            .await
+            .expect("semaphore closed");
+        let mut buffers = Vec::with_capacity(n);
+        {
+            let mut free_list = self.inner.free_list.lock().unwrap();
+            for _ in 0..n {
+                let index = free_list.pop().expect("free-list empty despite permit");
+                let buffer = self.inner.storage[index].clone();
+                buffers.push(PoolBuffer {
+                    buffer,
+                    index,
+                    pool: Arc::clone(&self.inner),
+                });
+            }
+        }
+        permit.forget();
+        buffers
     }
 
-    /// Returns the total number of buffers in the pool.
+    pub fn used_count(&self) -> usize {
+        self.inner.total_buffers - self.inner.free_list.lock().unwrap().len()
+    }
     pub fn total_count(&self) -> usize {
         self.inner.total_buffers
-    }
-}
-
-impl Deref for BufferGuard {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.buffer.as_deref().expect("buffer guard missing buffer")
-    }
-}
-
-impl DerefMut for BufferGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.buffer
-            .as_deref_mut()
-            .expect("buffer guard missing buffer")
-    }
-}
-
-impl Drop for BufferGuard {
-    fn drop(&mut self) {
-        if let Some(mut buffer) = self.buffer.take() {
-            buffer.clear();
-            buffer.resize(self.pool.buffer_size, 0);
-            let mut buffers = self.pool.buffers.lock().unwrap();
-            buffers.push(buffer);
-            self.pool.in_use.fetch_sub(1, Ordering::Relaxed);
-        }
     }
 }
 
@@ -92,17 +118,66 @@ impl Drop for BufferGuard {
 mod tests {
     use super::*;
 
-    #[test]
-    fn buffer_returns_to_pool_on_drop() {
-        let pool = BufferPool::new(1, 8);
-        {
-            let mut guard = pool.get_buffer();
-            guard[0] = 7;
-            guard[1] = 9;
-            assert_eq!(guard.len(), 8);
-        }
+    #[tokio::test]
+    async fn acquire_blocks_when_empty() {
+        let pool = Arc::new(BufferPool::new(1, 32));
+        let _buf1 = pool.acquire().await;
+        let pool_clone = Arc::clone(&pool);
+        let handle = tokio::spawn(async move {
+            let _buf2 = pool_clone.acquire().await;
+        });
+        tokio::task::yield_now().await;
+        drop(_buf1);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(
+            result.is_ok(),
+            "acquire should unblock after buffer is returned"
+        );
+    }
+    #[tokio::test]
+    async fn drop_returns_to_pool() {
+        let pool = Arc::new(BufferPool::new(1, 16));
+        assert_eq!(pool.used_count(), 0);
+        let buf = pool.acquire().await;
+        assert_eq!(pool.used_count(), 1);
+        drop(buf);
+        assert_eq!(pool.used_count(), 0);
+    }
+    #[tokio::test]
+    async fn used_count_tracks_in_use() {
+        let pool = Arc::new(BufferPool::new(3, 32));
+        assert_eq!(pool.used_count(), 0);
+        let b1 = pool.acquire().await;
+        assert_eq!(pool.used_count(), 1);
+        let b2 = pool.acquire().await;
+        assert_eq!(pool.used_count(), 2);
+        drop(b1);
+        assert_eq!(pool.used_count(), 1);
+        drop(b2);
+        assert_eq!(pool.used_count(), 0);
+    }
 
-        let guard = pool.get_buffer();
-        assert_eq!(guard.len(), 8);
+    #[tokio::test]
+    async fn split_to_returns_owned_slice() {
+        let pool = BufferPool::new(1, 64);
+        let mut buf = pool.acquire().await;
+        buf.buffer[0] = 10;
+        buf.buffer[1] = 20;
+        buf.buffer[2] = 30;
+        let slice = buf.split_to(3);
+        assert_eq!(slice.len(), 3);
+        assert_eq!(slice[0], 10);
+        assert_eq!(slice[1], 20);
+        assert_eq!(slice[2], 30);
+        assert_eq!(buf.buffer.len(), 61);
+    }
+    #[tokio::test]
+    async fn as_bytes_mut_returns_ref() {
+        let pool = BufferPool::new(1, 32);
+        let mut buf = pool.acquire().await;
+        let bytes_ref = buf.as_bytes_mut();
+        bytes_ref[0] = 99;
+        assert_eq!(buf.buffer[0], 99);
+        assert_eq!(buf.buffer.len(), 32);
     }
 }

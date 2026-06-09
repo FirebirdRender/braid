@@ -71,6 +71,30 @@ struct SendArgs {
     /// 0 = unlimited. Use this to match the receiver's link capacity.
     #[arg(long, short = 'r', default_value_t = 0, value_parser = parse_data_rate)]
     max_rate: u64,
+
+    /// Enable LZ4 compression for data transfer
+    #[arg(long, default_value_t = false)]
+    compress_lz4: bool,
+
+    /// Enable Zstd compression for data transfer
+    #[arg(long, default_value_t = false)]
+    compress_zstd: bool,
+
+    /// Enable connection retry on initial connect failure
+    #[arg(long, default_value_t = false)]
+    retry: bool,
+
+    /// Maximum number of connection retry attempts
+    #[arg(long, default_value_t = 3)]
+    max_retries: u32,
+
+    /// Initial delay between connection retries (exponential backoff)
+    #[arg(long, default_value_t = 1000)]
+    retry_delay: u64,
+
+    /// Maximum consecutive failures before a channel is considered dead
+    #[arg(long, default_value_t = 3)]
+    channel_failure_threshold: u32,
 }
 
 #[derive(Parser, Debug)]
@@ -203,16 +227,37 @@ async fn main() {
                 ProgressVerbosity::Normal
             };
 
-            let sender = braid_send::BraidSend::new_with_mode(
-                args.destination,
-                args.chunk_size,
-                args.channels,
-                args.mtu,
-                args.max_rate,
-                verbosity,
-                args.mode,
-                args.input,
-            );
+            let sender = if args.retry {
+                braid_send::BraidSend::new_with_retry(
+                    args.destination,
+                    args.chunk_size,
+                    args.channels,
+                    args.mtu,
+                    args.max_rate,
+                    verbosity,
+                    args.mode,
+                    args.input,
+                    args.compress_lz4,
+                    args.compress_zstd,
+                    args.retry,
+                    args.max_retries,
+                    args.retry_delay,
+                    args.channel_failure_threshold,
+                )
+            } else {
+                braid_send::BraidSend::new_with_mode(
+                    args.destination,
+                    args.chunk_size,
+                    args.channels,
+                    args.mtu,
+                    args.max_rate,
+                    verbosity,
+                    args.mode,
+                    args.input,
+                    args.compress_lz4,
+                    args.compress_zstd,
+                )
+            };
 
             if let Err(e) = sender.run().await {
                 eprintln!("braid send error: {e}");

@@ -66,6 +66,45 @@ impl ControlClient {
         })
     }
 
+    /// Connect to the control server with retries and exponential backoff.
+    ///
+    /// Tries to connect up to `max_retries` times. On failure (timeout or I/O),
+    /// waits with exponential backoff (`initial_delay` doubled each attempt,
+    /// capped at 60s) and retries. Logs each retry at `warn!` level.
+    ///
+    /// Returns `ControlError::Timeout` after all retries are exhausted.
+    pub async fn connect_with_retry(
+        addr: SocketAddr,
+        max_retries: u32,
+        initial_delay: Duration,
+        connect_timeout: Duration,
+    ) -> Result<Self> {
+        let mut delay = initial_delay;
+        for attempt in 1..=max_retries {
+            match Self::connect_with_timeout(addr, connect_timeout).await {
+                Ok(client) => return Ok(client),
+                Err(ControlError::Timeout) | Err(ControlError::Io(_)) => {
+                    if attempt == max_retries {
+                        tracing::warn!(
+                            "connect to {addr} failed after {max_retries} retries, giving up"
+                        );
+                        return Err(ControlError::Timeout);
+                    }
+                    tracing::warn!(
+                        "connect to {addr} failed (attempt {attempt}/{max_retries}), retrying in {delay:?}"
+                    );
+                    time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(60));
+                }
+                Err(e @ ControlError::Protocol(_)) => {
+                    // Protocol errors are not transient — return immediately
+                    return Err(e);
+                }
+            }
+        }
+        Err(ControlError::Timeout)
+    }
+
     pub async fn send_message(&mut self, msg: &ControlMessage) -> Result<()> {
         self.send_frame(&msg.to_bytes()).await
     }

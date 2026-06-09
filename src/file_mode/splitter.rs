@@ -1,6 +1,8 @@
+use bytes::Bytes;
 use tokio::fs::File;
 use tokio::sync::mpsc;
 
+use crate::buffer::pool::BufferPool;
 use crate::sender::splitter::ChunkSplitter;
 
 pub struct FileSplitter {
@@ -9,15 +11,16 @@ pub struct FileSplitter {
 
 impl FileSplitter {
     pub fn new(buffer_size: usize) -> Self {
+        let pool = BufferPool::new(2, buffer_size);
         Self {
-            inner: ChunkSplitter::new(buffer_size, buffer_size),
+            inner: ChunkSplitter::new(buffer_size, buffer_size, pool),
         }
     }
 
     pub async fn run_file(
         &self,
         input: File,
-        tx: mpsc::Sender<Vec<Vec<u8>>>,
+        tx: mpsc::Sender<Vec<Bytes>>,
         pause_rx: Option<mpsc::Receiver<bool>>,
     ) -> Result<(), std::io::Error> {
         self.inner.run(tx, pause_rx, input).await

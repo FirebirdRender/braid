@@ -9,6 +9,11 @@ use crate::control::client::{ControlClient, ControlError};
 use crate::control::server::ControlConnection;
 use crate::protocol::ControlMessage;
 
+/// Feature bit for LZ4 compression support.
+pub const FEATURE_COMPRESSION_LZ4: u32 = 1 << 30;
+/// Feature bit for Zstd compression support.
+pub const FEATURE_COMPRESSION_ZSTD: u32 = 1 << 31;
+
 pub type Result<T> = std::result::Result<T, NegotiationError>;
 
 #[derive(Debug)]
@@ -63,26 +68,40 @@ pub struct NegotiationConfig {
     pub max_chunk: u32,
     /// MTU in bytes (encoded as log2).
     pub mtu: u32,
+    /// Whether LZ4 compression is supported.
+    pub compression_lz4: bool,
+    /// Whether Zstd compression is supported.
+    pub compression_zstd: bool,
 }
 
 impl NegotiationConfig {
     /// Pack config into a u32 features bitfield.
-    /// Layout: [channel_count:8][min_chunk_log2:8][max_chunk_log2:8][mtu_log2:8]
+    /// Layout: [zstd:1][lz4:1][channel_count:6][min_chunk_log2:8][max_chunk_log2:8][mtu_log2:8]
+    /// Channel count is limited to 63 to leave bits 30-31 for compression flags.
     pub fn to_features(self) -> u32 {
-        let cc = (self.channel_count as u32) & 0xFF;
+        let mut features = 0u32;
+        if self.compression_lz4 {
+            features |= FEATURE_COMPRESSION_LZ4;
+        }
+        if self.compression_zstd {
+            features |= FEATURE_COMPRESSION_ZSTD;
+        }
+        let cc = (self.channel_count as u32) & 0x3F;
         let min = self.min_chunk & 0xFF;
         let max = self.max_chunk & 0xFF;
         let mtu = self.mtu & 0xFF;
-        (cc << 24) | (min << 16) | (max << 8) | mtu
+        features | (cc << 24) | (min << 16) | (max << 8) | mtu
     }
 
     /// Unpack features from a u32 bitfield.
     pub fn from_features(features: u32) -> Self {
         Self {
-            channel_count: ((features >> 24) & 0xFF) as u8,
+            channel_count: ((features >> 24) & 0x3F) as u8,
             min_chunk: (features >> 16) & 0xFF,
             max_chunk: (features >> 8) & 0xFF,
             mtu: features & 0xFF,
+            compression_lz4: features & FEATURE_COMPRESSION_LZ4 != 0,
+            compression_zstd: features & FEATURE_COMPRESSION_ZSTD != 0,
         }
     }
 }
@@ -268,7 +287,7 @@ pub async fn accept_negotiation(
 }
 
 /// Open a UDP socket on 0.0.0.0:0 with SO_REUSEADDR enabled.
-async fn open_udp_socket() -> std::io::Result<UdpSocket> {
+pub async fn open_udp_socket() -> std::io::Result<UdpSocket> {
     // Use socket2 to set SO_REUSEADDR before binding
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
@@ -320,6 +339,8 @@ mod tests {
             min_chunk: 10, // 2^10 = 1024
             max_chunk: 20, // 2^20 = 1048576
             mtu: 14,       // 2^14 = 16384
+            compression_lz4: false,
+            compression_zstd: false,
         };
 
         let (sender_res, receiver_res) = run_negotiation(config).await;
@@ -346,6 +367,8 @@ mod tests {
             min_chunk: 10,
             max_chunk: 20,
             mtu: 14,
+            compression_lz4: false,
+            compression_zstd: false,
         };
 
         let (sender_res, receiver_res) = run_negotiation(config).await;
@@ -362,21 +385,23 @@ mod tests {
     #[tokio::test]
     async fn max_channels_negotiation() {
         let config = NegotiationConfig {
-            channel_count: 255,
+            channel_count: 63,
             min_chunk: 10,
             max_chunk: 20,
             mtu: 14,
+            compression_lz4: false,
+            compression_zstd: false,
         };
 
         let (sender_res, receiver_res) = run_negotiation(config).await;
 
         let sender = sender_res.expect("sender negotiation should succeed");
-        assert_eq!(sender.channels.len(), 255);
+        assert_eq!(sender.channels.len(), 63);
         assert_eq!(sender.channels[0].channel_id, 0);
-        assert_eq!(sender.channels[254].channel_id, 254);
+        assert_eq!(sender.channels[62].channel_id, 62);
 
         let (_cfg, _socks, recv) = receiver_res.expect("receiver should succeed");
-        assert_eq!(recv.channels.len(), 255);
+        assert_eq!(recv.channels.len(), 63);
     }
 
     #[tokio::test]
@@ -386,6 +411,8 @@ mod tests {
             min_chunk: 10,
             max_chunk: 20,
             mtu: 14,
+            compression_lz4: false,
+            compression_zstd: false,
         };
 
         let features = config.to_features();
@@ -395,15 +422,124 @@ mod tests {
         assert_eq!(decoded.min_chunk, 10);
         assert_eq!(decoded.max_chunk, 20);
         assert_eq!(decoded.mtu, 14);
+        assert!(!decoded.compression_lz4);
+        assert!(!decoded.compression_zstd);
+    }
+
+    #[tokio::test]
+    async fn features_compression_lz4_round_trip() {
+        let config = NegotiationConfig {
+            channel_count: 4,
+            min_chunk: 10,
+            max_chunk: 20,
+            mtu: 14,
+            compression_lz4: true,
+            compression_zstd: false,
+        };
+
+        let features = config.to_features();
+        assert!(
+            features & FEATURE_COMPRESSION_LZ4 != 0,
+            "LZ4 bit should be set"
+        );
+        assert!(
+            features & FEATURE_COMPRESSION_ZSTD == 0,
+            "Zstd bit should be clear"
+        );
+
+        let decoded = NegotiationConfig::from_features(features);
+        assert!(decoded.compression_lz4);
+        assert!(!decoded.compression_zstd);
+        assert_eq!(decoded.channel_count, 4);
+    }
+
+    #[tokio::test]
+    async fn features_compression_zstd_round_trip() {
+        let config = NegotiationConfig {
+            channel_count: 4,
+            min_chunk: 10,
+            max_chunk: 20,
+            mtu: 14,
+            compression_lz4: false,
+            compression_zstd: true,
+        };
+
+        let features = config.to_features();
+        assert!(
+            features & FEATURE_COMPRESSION_ZSTD != 0,
+            "Zstd bit should be set"
+        );
+        assert!(
+            features & FEATURE_COMPRESSION_LZ4 == 0,
+            "LZ4 bit should be clear"
+        );
+
+        let decoded = NegotiationConfig::from_features(features);
+        assert!(!decoded.compression_lz4);
+        assert!(decoded.compression_zstd);
+    }
+
+    #[tokio::test]
+    async fn features_compression_both_round_trip() {
+        let config = NegotiationConfig {
+            channel_count: 2,
+            min_chunk: 10,
+            max_chunk: 20,
+            mtu: 14,
+            compression_lz4: true,
+            compression_zstd: true,
+        };
+
+        let features = config.to_features();
+        assert!(features & FEATURE_COMPRESSION_LZ4 != 0);
+        assert!(features & FEATURE_COMPRESSION_ZSTD != 0);
+
+        let decoded = NegotiationConfig::from_features(features);
+        assert!(decoded.compression_lz4);
+        assert!(decoded.compression_zstd);
+    }
+
+    #[tokio::test]
+    async fn features_compression_bits_dont_interfere() {
+        // Verify compression bits don't collide with existing fields
+let config_no_compress = NegotiationConfig {
+            channel_count: 63,
+            min_chunk: 255,
+            max_chunk: 255,
+            mtu: 255,
+            compression_lz4: false,
+            compression_zstd: false,
+        };
+
+        let config_with_compress = NegotiationConfig {
+            channel_count: 63,
+            min_chunk: 255,
+            max_chunk: 255,
+            mtu: 255,
+            compression_lz4: true,
+            compression_zstd: true,
+        };
+
+        let f1 = config_no_compress.to_features();
+        let f2 = config_with_compress.to_features();
+
+        // Lower 30 bits should be identical (bits 29..0)
+        assert_eq!(f1 & 0x3FFFFFFF, f2 & 0x3FFFFFFF);
+        // Top 2 bits should differ
+        assert_eq!(f1 & 0xC0000000, 0);
+        assert_eq!(f2 & 0xC0000000, 0xC0000000);
     }
 
     #[tokio::test]
     async fn features_zero_values() {
+
         let config = NegotiationConfig {
             channel_count: 0,
             min_chunk: 0,
             max_chunk: 0,
             mtu: 0,
+            compression_lz4: false,
+            compression_zstd: false,
         };
 
         let features = config.to_features();
@@ -422,6 +558,8 @@ mod tests {
             min_chunk: 10,
             max_chunk: 20,
             mtu: 14,
+            compression_lz4: false,
+            compression_zstd: false,
         };
 
         let (sender_res, receiver_res) = run_negotiation(config).await;
@@ -453,6 +591,8 @@ mod tests {
             min_chunk: 10,
             max_chunk: 20,
             mtu: 14,
+            compression_lz4: false,
+            compression_zstd: false,
         };
 
         let (sender_res, receiver_res) = run_negotiation(config).await;

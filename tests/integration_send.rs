@@ -2,8 +2,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use braid::adaptive::channels::ChannelCountAdaptor;
 use braid::adaptive::chunk_size::ChunkSizeAdaptor;
+use braid::buffer::pool::BufferPool;
 use braid::control::client::ControlClient;
 use braid::control::negotiation::{negotiate, NegotiationConfig};
 use braid::control::server::ControlServer;
@@ -34,6 +36,8 @@ async fn setup_negotiation(
         min_chunk: 10,
         max_chunk: 20,
         mtu: 14,
+        compression_lz4: false,
+        compression_zstd: false,
     };
 
     let sender_result = negotiate(&mut client, config).await.unwrap();
@@ -84,7 +88,8 @@ async fn test_shutdown_manager_subscribe() {
 
 #[tokio::test]
 async fn test_chunk_splitter_creation() {
-    let splitter = ChunkSplitter::new(1024, 1500);
+    let pool = BufferPool::new(2, 1500);
+    let splitter = ChunkSplitter::new(1024, 1500, pool);
     assert_eq!(splitter.chunk_size(), 1024);
     assert_eq!(splitter.mtu(), 1500);
     assert!(splitter.fragment_payload_size() > 0);
@@ -115,7 +120,7 @@ async fn test_queue_manager_build() {
 #[tokio::test]
 async fn test_queue_manager_dispatch() {
     let (mut mgr, _receivers) = QueueManagerBuilder::new(2).channel_capacity(64).build();
-    let result = mgr.dispatch(vec![0u8; 100]);
+    let result = mgr.dispatch(Bytes::from(vec![0u8; 100]));
     assert!(result.is_ok());
 }
 
@@ -128,6 +133,7 @@ async fn test_udp_worker_creation() {
         65536,
         Duration::from_secs(1),
         Arc::new(UdpSendWorkerStats::default()),
+        None,
     );
     let socket = worker.bind().await.unwrap();
     let local = socket.local_addr().unwrap();
@@ -189,16 +195,17 @@ async fn test_worker_direct_send() {
         65536,
         Duration::from_secs(1),
         Arc::new(UdpSendWorkerStats::default()),
+        None,
     );
     let socket = worker.bind().await.unwrap();
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
 
     let worker_handle = tokio::spawn(async move {
         worker.run(socket, rx).await;
     });
 
-    let fragment_data = vec![0x42u8; 100];
+    let fragment_data = Bytes::from(vec![0x42u8; 100]);
     tx.send(fragment_data.clone()).await.unwrap();
     drop(tx);
 

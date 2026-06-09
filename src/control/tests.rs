@@ -53,3 +53,78 @@ async fn tcp_control_connection_timeout() {
         other => panic!("unexpected error: {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn accept_with_retry_returns_connection_on_success() {
+    let server = ControlServer::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr: SocketAddr = server.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server
+            .accept_with_retry(3, Duration::from_millis(10))
+            .await
+            .unwrap();
+        // Connection accepted successfully
+        assert!(std::mem::size_of_val(&conn) > 0);
+    });
+
+    let mut client = ControlClient::connect(addr).await.unwrap();
+    client
+        .send_message(&ControlMessage::Hello {
+            protocol_version: 1,
+            features: 0,
+        })
+        .await
+        .unwrap();
+
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn accept_with_retry_retries_on_timeout_then_succeeds() {
+    let server = ControlServer::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap()
+        .with_accept_timeout(Duration::from_millis(50));
+    let addr: SocketAddr = server.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server
+            .accept_with_retry(3, Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(std::mem::size_of_val(&conn) > 0);
+    });
+
+    // Wait longer than the accept timeout so the first attempt times out,
+    // then connect before all retries are exhausted.
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    let mut client = ControlClient::connect(addr).await.unwrap();
+    client
+        .send_message(&ControlMessage::Hello {
+            protocol_version: 1,
+            features: 0,
+        })
+        .await
+        .unwrap();
+
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn accept_with_retry_exhausts_retries_and_returns_timeout() {
+    let server = ControlServer::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap()
+        .with_accept_timeout(Duration::from_millis(20));
+
+    let err = server
+        .accept_with_retry(2, Duration::from_millis(1))
+        .await
+        .err()
+        .unwrap();
+
+    assert!(matches!(err, ControlError::Timeout));
+}
