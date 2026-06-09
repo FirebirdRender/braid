@@ -175,6 +175,10 @@ Options:
       --max-retries <MAX_RETRIES>          Maximum retry attempts [default: 3]
       --retry-delay <RETRY_DELAY>          Initial retry delay in ms [default: 1000]
       --channel-failure-threshold <N>      Consecutive failures before dead [default: 3]
+      --batch-size <N>                     sendmmsg batch size [default: 16]
+      --batch-usec <USEC>                  Max time (µs) to wait before flushing batch [default: 100]
+      --no-batch                           Disable sendmmsg batching (use single-send per datagram)
+      --chunker-threads <N>                Number of parallel chunker workers (0 = auto: num_cpus/2) [default: 0]
   -h, --help                               Print help
 ```
 
@@ -207,9 +211,12 @@ On loopback, larger MTUs (8800–65535) give the best throughput. On real networ
 
 ## Performance
 
-BRAID achieves ~455 MiB/s on loopback at MTU 1500 with 4 parallel channels (Criterion benchmark: `pipeline/full/65535`). Performance scales with MTU size and channel count — at MTU 8800, e2e throughput reaches ~669 MB/s (6.6 Gbps).
+BRAID achieves ~455 MiB/s on loopback at MTU 1500 with 4 parallel channels (Criterion benchmark: `pipeline/full/65535`). Performance scales with MTU size and channel count — at MTU 8800, throughput reaches **908 MiB/s (7.6 Gbps)** with sendmmsg batching and the multithreaded chunker enabled.
 
 Key optimizations:
+- **sendmmsg batch send**: batches up to 16 datagrams per syscall (default), or configurable via `--batch-size`. Reduces syscall overhead by up to 16×. Falls back to single-send on kernels without sendmmsg support.
+- **Multithreaded chunker**: LZ4 compression, CRC computation, and fragmentation run in parallel across N worker tasks (default: `num_cpus / 2`). Configurable via `--chunker-threads`.
+- **Lock-free buffer pool**: `crossbeam::ArrayQueue` eliminates `Mutex` contention when multiple chunker workers access the buffer pool simultaneously.
 - **Zero-copy buffer pool**: pre-allocated `BytesMut` pool with semaphore-based acquire/release eliminates hot-path allocations
 - **Zero-allocation fragment CRC**: chained `crc32fast::Hasher` avoids intermediate Vec
 - **Hash-sharded reassembly**: N parallel reassemblers distributed by `chunk_id % N`
@@ -232,9 +239,10 @@ src/
 │   ├── crc.rs             # CRC32C computation
 │   └── control.rs         # TCP control protocol messages
 ├── sender/
-│   ├── splitter.rs        # ChunkSplitter: stdin → fragments
+│   ├── splitter.rs        # ChunkSplitter: stdin → fragments (single-threaded)
+│   ├── parallel_splitter.rs # Dispatcher + chunker_worker (multithreaded)
 │   ├── queue.rs           # QueueManager: LACP-like dispatch
-│   ├── worker.rs          # UdpSendWorker: per-channel UDP sender
+│   ├── worker.rs          # UdpSendWorker + BatchSendWorker (sendmmsg)
 │   └── health.rs          # ChannelHealth: per-channel failure tracking
 ├── receiver/
 │   ├── reassembly.rs      # FragmentReassembler: fragments → chunks
@@ -259,30 +267,46 @@ src/
 └── error/                 # Error types
 ```
 
-## v0.4.0 Features
+## v0.5.0 Features
 
-### Buffer Pool (zero-copy pipeline)
+### sendmmsg Batch Send
 
-v0.4.0 replaces all hot-path `Vec<u8>` allocations with `bytes::Bytes` backed by a pre-allocated buffer pool:
+v0.5.0 replaces per-datagram `send_to()` with `sendmmsg()` batching:
 
-- **Semaphore-based acquire/release**: `tokio::sync::Semaphore` controls access to a pool of pre-allocated `BytesMut` buffers
-- **PoolBuffer**: auto-returns to pool on drop, supports zero-copy `split_to().freeze()` instead of `to_vec()` copy
-- **`acquire_many(n)`**: batch allocate buffers for bulk operations
-- **Integrated everywhere**: UDP receive worker, fragment reassembly, and chunk splitter all use pool buffers
+- **`--batch-size`**: Number of datagrams per `sendmmsg` call (default: 16). Reduces syscall overhead by up to 16× on Linux.
+- **`--batch-usec`**: Maximum time to wait before flushing an incomplete batch (default: 100µs).
+- **`--no-batch`**: Disable batching and revert to single-send per datagram (for compatibility).
+- **ENOSYS fallback**: Automatically detects kernels without sendmmsg support and falls back to single-send via atomic boolean toggle.
+- **Memory safety**: `msgvec`/`iovecs` arrays rebuilt from scratch after each partial send — no dangling pointer risk.
+- **EAGAIN handling**: On socket congestion, yields via `socket.writable()` before retrying (up to 1024 retries).
 
-### Connection Resilience
+### Multithreaded Chunker
 
-- **`--retry` / `--max-retries` / `--retry-delay`**: Exponential backoff retry on TCP connection failure (doubles each attempt, capped at 60s)
-- **`--channel-failure-threshold`**: Per-channel health monitoring — workers report success/failure, dead channels trigger fragment redistribution
-- **Reconnect protocol**: When all UDP channels fail mid-transfer, sender sends `Reconnect` message over TCP control connection, receiver opens new UDP sockets, transfer resumes
-- **`accept_with_retry()`**: Receiver re-enters accept loop after completed sessions
+v0.5.0 replaces the single-threaded chunker pipeline with a dispatcher + N parallel workers:
 
-### LZ4 Compression
+- **`--chunker-threads`**: Number of parallel worker tasks (default: `num_cpus / 2`, minimum 1).
+- **Dispatcher**: Reads stdin/file, round-robins raw chunks to workers via dedicated mpsc channels.
+- **Workers**: Each worker performs LZ4 compression, CRC computation, and fragmentation independently.
+- **Wire format identical**: Receiver has no knowledge of parallelization — fragments are identical to the single-threaded path.
+- **Lock-free BufferPool**: `crossbeam::ArrayQueue` replaces `Mutex<Vec<usize>>` for contention-free concurrent buffer access.
 
-- **`--compress-lz4`**: Enable LZ4 compression at the chunk level (before fragmentation)
-- **Auto-disable**: Incompressible data sent uncompressed automatically (per-chunk flag)
-- **CRC on uncompressed data**: CRCs computed on original data, verified after decompression — catches both network errors and decompression bugs
-- **Zero C dependencies**: `lz4_flex` is pure Rust
+### Performance Benchmarks
+
+Pre-optimization (single-threaded chunker, no sendmmsg):
+
+| Data Volume | Wire Time | Throughput | Receiver Peak |
+|-------------|-----------|------------|---------------|
+| 1 GiB | 1.610s | 635 MiB/s (5.3 Gbps) | 507.73 MB/s |
+
+Post-optimization (batch=16, chunker-threads=auto):
+
+| Data Volume | Wire Time | Throughput | Receiver Peak |
+|-------------|-----------|------------|---------------|
+| 1 GiB | 1.126s | 908 MiB/s (7.6 Gbps) | 527.55 MB/s |
+
+Full pipeline (mbuffer → braid → mbuffer): 715 MiB/s (6.0 Gbps)
+
+**Improvement: +43% throughput** over the single-threaded baseline.
 
 ### Fragment Wire Format
 

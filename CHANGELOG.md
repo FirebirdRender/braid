@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-09
+
+### Added
+
+- **sendmmsg batch send**: `BatchSendWorker` replaces per-datagram `send_to()` with `sendmmsg()` batching (default batch size: 16). Reduces syscall overhead by up to 16× on Linux. ENOSYS fallback to single-send via atomic boolean toggle.
+- **Multithreaded chunker**: New `parallel_splitter` module with `Dispatcher` + N parallel `chunker_worker` tasks. Workers run LZ4 compression, CRC, and fragmentation in parallel across available cores. Default worker count: `num_cpus / 2`.
+- **Lock-free BufferPool**: Replaced `Mutex<Vec<usize>>` free-list with `crossbeam::queue::ArrayQueue` for contention-free concurrent access by parallel chunker workers.
+- **CLI flags**: `--batch-size` (sendmmsg batch size, default 16), `--batch-usec` (flush timeout, default 100µs), `--no-batch` (disable sendmmsg), `--chunker-threads` (parallel workers, 0=auto).
+
+### Changed
+
+- Version bump: 0.4.0 → 0.5.0
+
+### Performance
+
+- 43% throughput improvement on loopback: 635 → 908 MiB/s (MTU 8800, 4 channels, 1 GiB data)
+- Receiver peak throughput stable at ~528 MB/s (post-optimization)
+- Full pipeline (mbuffer → braid → mbuffer): 715 MiB/s (6.0 Gbps)
+
 ## [0.4.0] - 2026-06-09
 
 ### Added
