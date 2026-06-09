@@ -316,16 +316,29 @@ let fragment = Bytes::copy_from_slice(&pool_buf.buffer[..n]);
             let handle = tokio::spawn(async move {
                 info!("fragment reassembler {} started", i);
                 let mut rx = rx;
+                // Periodically run check_timeouts() to evict stale incomplete chunks.
+                // Without this, lost fragments create zombie entries that grow the
+                // chunks HashMap unboundedly — enforce_memory_bound() only evicts
+                // incomplete chunks (not completed-but-stuck ones waiting on tx.send()).
+                let mut timeout_check = tokio::time::interval(Duration::from_secs(10));
+                timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    match rx.recv().await {
-                        Some(data) => {
-                            if let Err(e) = reassembler.add_fragment(data).await {
-                                error!("reassembler {} error: {}", i, e);
+                    tokio::select! {
+                        data = rx.recv() => {
+                            match data {
+                                Some(data) => {
+                                    if let Err(e) = reassembler.add_fragment(data).await {
+                                        error!("reassembler {} error: {}", i, e);
+                                    }
+                                }
+                                None => {
+                                    info!("fragment channel {} closed, reassembler {} stopping", i, i);
+                                    break;
+                                }
                             }
                         }
-                        None => {
-                            info!("fragment channel {} closed, reassembler {} stopping", i, i);
-                            break;
+                        _ = timeout_check.tick() => {
+                            reassembler.check_timeouts();
                         }
                     }
                 }
