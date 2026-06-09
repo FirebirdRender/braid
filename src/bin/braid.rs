@@ -95,6 +95,18 @@ struct SendArgs {
     /// Maximum consecutive failures before a channel is considered dead
     #[arg(long, default_value_t = 3)]
     channel_failure_threshold: u32,
+
+    /// Maximum datagrams per sendmmsg batch call (default: 16)
+    #[arg(long, default_value_t = 16)]
+    batch_size: usize,
+
+    /// Maximum wait in microseconds before flushing an incomplete batch (default: 100)
+    #[arg(long, default_value_t = 100)]
+    batch_usec: u64,
+
+    /// Disable sendmmsg batching; use single-send per datagram
+    #[arg(long, default_value_t = false)]
+    no_batch: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -243,6 +255,9 @@ async fn main() {
                     args.max_retries,
                     args.retry_delay,
                     args.channel_failure_threshold,
+                    args.batch_size,
+                    args.batch_usec,
+                    args.no_batch,
                 )
             } else {
                 braid_send::BraidSend::new_with_mode(
@@ -256,6 +271,9 @@ async fn main() {
                     args.input,
                     args.compress_lz4,
                     args.compress_zstd,
+                    args.batch_size,
+                    args.batch_usec,
+                    args.no_batch,
                 )
             };
 

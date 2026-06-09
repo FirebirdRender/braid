@@ -1,3 +1,6 @@
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+
 use bytes::Bytes;
 use tokio::fs::File;
 use tokio::sync::mpsc;
@@ -13,7 +16,12 @@ impl FileSplitter {
     pub fn new(buffer_size: usize) -> Self {
         let pool = BufferPool::new(2, buffer_size);
         Self {
-            inner: ChunkSplitter::new(buffer_size, buffer_size, pool),
+            inner: ChunkSplitter::new(
+                Arc::new(AtomicUsize::new(buffer_size)),
+                buffer_size,
+                buffer_size,
+                pool,
+            ),
         }
     }
 

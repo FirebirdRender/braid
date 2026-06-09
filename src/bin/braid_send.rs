@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
 
@@ -17,7 +18,7 @@ use braid::progress::reporter::{ProgressReporter, ProgressVerbosity};
 use braid::protocol::ControlMessage;
 use braid::sender::queue::QueueManagerBuilder;
 use braid::sender::splitter::ChunkSplitter;
-use braid::sender::worker::{UdpSendWorker, UdpSendWorkerStats};
+use braid::sender::worker::{BatchSendWorker, UdpSendWorker, UdpSendWorkerStats, WorkerResult};
 use braid::shutdown::manager::ShutdownManager;
 
 use super::Mode;
@@ -36,6 +37,12 @@ const DEFAULT_SO_SNDBUF: usize = 64 * 1024 * 1024;
 
 /// Default per-datagram send timeout.
 const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default sendmmsg batch size (datagrams per syscall).
+const DEFAULT_BATCH_SIZE: usize = 16;
+
+/// Default batch flush timeout in microseconds.
+const DEFAULT_BATCH_USEC: u64 = 100;
 
 /// Default initial channel count for negotiation.
 const DEFAULT_INITIAL_CHANNELS: usize = 4;
@@ -66,6 +73,31 @@ pub struct BraidSend {
     retry_delay: u64,
     #[allow(dead_code)]
     channel_failure_threshold: u32,
+    batch_size: usize,
+    batch_usec: u64,
+    no_batch: bool,
+}
+
+/// Dispatches between BatchSendWorker and UdpSendWorker at creation and spawn time.
+enum WorkerKind {
+    Batch(BatchSendWorker),
+    Single(UdpSendWorker),
+}
+
+impl WorkerKind {
+    async fn bind(&self) -> std::io::Result<UdpSocket> {
+        match self {
+            WorkerKind::Batch(w) => w.bind().await,
+            WorkerKind::Single(w) => w.bind().await,
+        }
+    }
+
+    async fn run(self, socket: UdpSocket, rx: mpsc::Receiver<Bytes>) {
+        match self {
+            WorkerKind::Batch(w) => w.run(socket, rx).await,
+            WorkerKind::Single(w) => w.run(socket, rx).await,
+        }
+    }
 }
 
 impl BraidSend {
@@ -90,6 +122,9 @@ impl BraidSend {
             None,
             true,  // compress_lz4
             false, // compress_zstd
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_BATCH_USEC,
+            false, // no_batch
         )
     }
 
@@ -110,6 +145,9 @@ impl BraidSend {
         input: Option<PathBuf>,
         compress_lz4: bool,
         compress_zstd: bool,
+        batch_size: usize,
+        batch_usec: u64,
+        no_batch: bool,
     ) -> Self {
         Self {
             destination,
@@ -126,6 +164,9 @@ impl BraidSend {
             max_retries: 3,
             retry_delay: 1000,
             channel_failure_threshold: 3,
+            batch_size,
+            batch_usec,
+            no_batch,
         }
     }
 
@@ -146,6 +187,9 @@ impl BraidSend {
         max_retries: u32,
         retry_delay: u64,
         channel_failure_threshold: u32,
+        batch_size: usize,
+        batch_usec: u64,
+        no_batch: bool,
     ) -> Self {
         Self {
             destination,
@@ -162,6 +206,9 @@ impl BraidSend {
             max_retries,
             retry_delay,
             channel_failure_threshold,
+            batch_size,
+            batch_usec,
+            no_batch,
         }
     }
 
@@ -255,15 +302,29 @@ impl BraidSend {
         let mut worker_sockets = Vec::with_capacity(channels.len());
         let mut health_rxs = Vec::with_capacity(channels.len());
         for ch in channels.iter() {
-            let (health_tx, health_rx) = mpsc::channel::<braid::sender::worker::WorkerResult>(16);
-            let worker = UdpSendWorker::new(
-                0,
-                SocketAddr::new(self.destination.ip(), ch.port),
-                DEFAULT_SO_SNDBUF,
-                DEFAULT_SEND_TIMEOUT,
-                Arc::new(UdpSendWorkerStats::default()),
-                Some(health_tx),
-            );
+            let (health_tx, health_rx) = mpsc::channel::<WorkerResult>(16);
+            let dest = SocketAddr::new(self.destination.ip(), ch.port);
+            let worker: WorkerKind = if self.no_batch {
+                WorkerKind::Single(UdpSendWorker::new(
+                    0,
+                    dest,
+                    DEFAULT_SO_SNDBUF,
+                    DEFAULT_SEND_TIMEOUT,
+                    Arc::new(UdpSendWorkerStats::default()),
+                    Some(health_tx),
+                ))
+            } else {
+                WorkerKind::Batch(BatchSendWorker::new(
+                    0,
+                    dest,
+                    DEFAULT_SO_SNDBUF,
+                    DEFAULT_SEND_TIMEOUT,
+                    self.batch_size,
+                    self.batch_usec,
+                    Arc::new(UdpSendWorkerStats::default()),
+                    Some(health_tx),
+                ))
+            };
             let socket = worker.bind().await?;
             worker_sockets.push((worker, socket));
             health_rxs.push(health_rx);
@@ -314,13 +375,19 @@ impl BraidSend {
 
         // ─── Step 9: Spawn pipeline tasks ────────────────────────────────
         // Spawn ChunkSplitter
-        let splitter_pool = BufferPool::new(4, self.mtu);
+        // Pool buffer must be large enough for the largest read: max(chunk_size, mtu).
+        let effective_chunk_size = if self.chunk_size > 0 {
+            self.chunk_size
+        } else {
+            braid::adaptive::chunk_size::DEFAULT_INITIAL_CHUNK
+        };
+        let max_chunk_size = effective_chunk_size.max(braid::adaptive::chunk_size::MAX_CHUNK);
+        let pool_buf_size = max_chunk_size.max(self.mtu);
+        let chunk_size_atomic = Arc::new(std::sync::atomic::AtomicUsize::new(effective_chunk_size));
+        let splitter_pool = BufferPool::new(4, pool_buf_size);
         let splitter = ChunkSplitter::new(
-            if self.chunk_size > 0 {
-                self.chunk_size
-            } else {
-                braid::adaptive::chunk_size::DEFAULT_INITIAL_CHUNK
-            },
+            chunk_size_atomic.clone(),
+            max_chunk_size,
             self.mtu,
             splitter_pool,
         );
@@ -652,14 +719,28 @@ impl BraidSend {
             // Create new UDP send workers.
             let mut new_worker_sockets = Vec::with_capacity(new_channels.len());
             for (_channel_id, port) in &new_channels {
-                let worker = UdpSendWorker::new(
-                    0,
-                    SocketAddr::new(self.destination.ip(), *port as u16),
-                    DEFAULT_SO_SNDBUF,
-                    DEFAULT_SEND_TIMEOUT,
-                    Arc::new(UdpSendWorkerStats::default()),
-                    None, // health reporting not wired on reconnect path
-                );
+                let dest = SocketAddr::new(self.destination.ip(), *port as u16);
+                let worker: WorkerKind = if self.no_batch {
+                    WorkerKind::Single(UdpSendWorker::new(
+                        0,
+                        dest,
+                        DEFAULT_SO_SNDBUF,
+                        DEFAULT_SEND_TIMEOUT,
+                        Arc::new(UdpSendWorkerStats::default()),
+                        None, // health reporting not wired on reconnect path
+                    ))
+                } else {
+                    WorkerKind::Batch(BatchSendWorker::new(
+                        0,
+                        dest,
+                        DEFAULT_SO_SNDBUF,
+                        DEFAULT_SEND_TIMEOUT,
+                        self.batch_size,
+                        self.batch_usec,
+                        Arc::new(UdpSendWorkerStats::default()),
+                        None,
+                    ))
+                };
                 let socket = worker.bind().await?;
                 new_worker_sockets.push((worker, socket));
             }
@@ -692,13 +773,18 @@ impl BraidSend {
             // Restart the splitter (stdin or file).
             let (new_fragment_tx, new_fragment_rx) =
                 mpsc::channel::<Vec<Bytes>>(DEFAULT_CHANNEL_CAPACITY);
-            let reconnect_pool = BufferPool::new(4, self.mtu);
+            let reconnect_effective_chunk_size = if self.chunk_size > 0 {
+                self.chunk_size
+            } else {
+                braid::adaptive::chunk_size::DEFAULT_INITIAL_CHUNK
+            };
+            let reconnect_max_chunk_size = reconnect_effective_chunk_size.max(braid::adaptive::chunk_size::MAX_CHUNK);
+            let reconnect_pool_buf_size = reconnect_max_chunk_size.max(self.mtu);
+            let reconnect_pool = BufferPool::new(4, reconnect_pool_buf_size);
+            let reconnect_chunk_size = Arc::new(std::sync::atomic::AtomicUsize::new(reconnect_effective_chunk_size));
             let splitter = ChunkSplitter::new(
-                if self.chunk_size > 0 {
-                    self.chunk_size
-                } else {
-                    braid::adaptive::chunk_size::DEFAULT_INITIAL_CHUNK
-                },
+                reconnect_chunk_size,
+                reconnect_max_chunk_size,
                 self.mtu,
                 reconnect_pool,
             );

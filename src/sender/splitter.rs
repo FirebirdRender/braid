@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, BufReader};
@@ -40,7 +41,8 @@ const DEFAULT_BATCH_SIZE: usize = 64;
 /// When the mpsc channel is full, the splitter blocks reading from stdin,
 /// applying natural backpressure upstream.
 pub struct ChunkSplitter {
-    chunk_size: usize,
+    chunk_size: Arc<AtomicUsize>,
+    max_chunk_size: usize,
     mtu: usize,
     next_chunk_id: AtomicU64,
     fragment_payload_size: usize,
@@ -54,8 +56,11 @@ impl ChunkSplitter {
     /// * `mtu` - Maximum transmission unit in bytes. Fragment payloads are
     ///   sized to fit within this minus `FragmentHeader::LEN`.
     /// * `pool` - Buffer pool to use for I/O buffers.
-    pub fn new(chunk_size: usize, mtu: usize, pool: BufferPool) -> Self {
-        assert!(chunk_size > 0, "chunk_size must be positive");
+    pub fn new(chunk_size: Arc<AtomicUsize>, max_chunk_size: usize, mtu: usize, pool: BufferPool) -> Self {
+        assert!(
+            chunk_size.load(Ordering::Acquire) > 0,
+            "chunk_size must be positive"
+        );
         assert!(
             mtu > FragmentHeader::LEN,
             "mtu must be larger than FragmentHeader::LEN"
@@ -69,6 +74,7 @@ impl ChunkSplitter {
 
         Self {
             chunk_size,
+            max_chunk_size,
             mtu,
             next_chunk_id: AtomicU64::new(0),
             fragment_payload_size,
@@ -91,9 +97,14 @@ impl ChunkSplitter {
         self.mtu
     }
 
-    /// Returns the configured chunk size.
+    /// Returns the current chunk size (from the atomic).
     pub fn chunk_size(&self) -> usize {
-        self.chunk_size
+        self.chunk_size.load(Ordering::Acquire)
+    }
+
+    /// Update the chunk size at runtime (called by control handler).
+    pub fn set_chunk_size(&self, new_size: usize) {
+        self.chunk_size.store(new_size, Ordering::Release);
     }
 
     /// Run the splitter: reads from the given reader, produces fragments into the channel.
@@ -122,7 +133,7 @@ impl ChunkSplitter {
         let mut reader = BufReader::new(reader);
         let mut pool_read_buf = self.pool.acquire().await;
         // Pre-allocate chunk buffer and reuse it each iteration
-        let mut chunk_buf = BytesMut::with_capacity(ChunkHeader::LEN + self.chunk_size);
+        let mut chunk_buf = BytesMut::with_capacity(ChunkHeader::LEN + self.max_chunk_size);
         // Batch buffer: collect fragments and send in bulk
         let mut batch: Vec<Bytes> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
 
@@ -160,7 +171,7 @@ impl ChunkSplitter {
             // Use tokio::select! to read from stdin OR handle pause signals
             let bytes_read: usize;
             tokio::select! {
-                result = reader.read(&mut pool_read_buf.buffer[..self.chunk_size]) => {
+                result = reader.read(&mut pool_read_buf.buffer[..self.chunk_size.load(Ordering::Acquire)]) => {
                     let n = result?;
                     if n == 0 {
                         // EOF: flush remaining batch, then return.
@@ -264,7 +275,7 @@ mod tests {
     /// Helper: create a splitter with small values for testing.
     fn test_splitter(chunk_size: usize, mtu: usize) -> ChunkSplitter {
         let pool = BufferPool::new(2, chunk_size.max(mtu));
-        ChunkSplitter::new(chunk_size, mtu, pool)
+        ChunkSplitter::new(Arc::new(AtomicUsize::new(chunk_size)), chunk_size, mtu, pool)
     }
 
     /// Helper: collect all fragments from a splitter run into a Vec.
@@ -416,21 +427,21 @@ mod tests {
     #[should_panic(expected = "chunk_size must be positive")]
     fn rejects_zero_chunk_size() {
         let pool = crate::buffer::pool::BufferPool::new(2, 1500);
-        ChunkSplitter::new(0, 1500, pool);
+        ChunkSplitter::new(Arc::new(AtomicUsize::new(0)), 0, 1500, pool);
     }
 
     #[test]
     #[should_panic(expected = "mtu must be larger than FragmentHeader::LEN")]
     fn rejects_mtu_too_small() {
         let pool = crate::buffer::pool::BufferPool::new(2, 1500);
-        ChunkSplitter::new(1024, FragmentHeader::LEN, pool);
+        ChunkSplitter::new(Arc::new(AtomicUsize::new(1024)), 1024, FragmentHeader::LEN, pool);
     }
 
     #[test]
     fn fragment_payload_size_never_zero() {
         // MTU = FragmentHeader::LEN + 1 → fragment_payload_size = 1
         let pool = crate::buffer::pool::BufferPool::new(2, 1500);
-        let s = ChunkSplitter::new(1024, FragmentHeader::LEN + 1, pool);
+        let s = ChunkSplitter::new(Arc::new(AtomicUsize::new(1024)), 1024, FragmentHeader::LEN + 1, pool);
         assert_eq!(s.fragment_payload_size(), 1);
     }
 
@@ -439,7 +450,7 @@ mod tests {
     #[tokio::test]
     async fn run_produces_fragments_then_eos() {
         let pool = crate::buffer::pool::BufferPool::new(2, 1500);
-        let _s = ChunkSplitter::new(1024, 1500, pool);
+        let _s = ChunkSplitter::new(Arc::new(AtomicUsize::new(1024)), 1024, 1500, pool);
         let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(64);
 
         // Simulate a small input by directly constructing fragments
@@ -479,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn backpressure_blocks_when_channel_full() {
         let pool = crate::buffer::pool::BufferPool::new(2, 1500);
-        let _s = ChunkSplitter::new(1024, 1500, pool);
+        let _s = ChunkSplitter::new(Arc::new(AtomicUsize::new(1024)), 1024, 1500, pool);
         // Use a tiny channel capacity to force backpressure
         let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(1);
 
@@ -607,7 +618,7 @@ mod tests {
     #[tokio::test]
     async fn test_splitter_pause_resume() {
         let pool = crate::buffer::pool::BufferPool::new(2, 1500);
-        let splitter = ChunkSplitter::new(64, 1500, pool);
+        let splitter = ChunkSplitter::new(Arc::new(AtomicUsize::new(64)), 64, 1500, pool);
         let (fragment_tx, _fragment_rx) = mpsc::channel::<Vec<Bytes>>(16);
         let (pause_tx, pause_rx) = mpsc::channel::<bool>(16);
 
@@ -645,7 +656,7 @@ mod tests {
             .expect("open temp file");
 
         let pool = crate::buffer::pool::BufferPool::new(2, 1500);
-        let splitter = ChunkSplitter::new(64, 1500, pool);
+        let splitter = ChunkSplitter::new(Arc::new(AtomicUsize::new(64)), 64, 1500, pool);
         let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(64);
 
         let handle = tokio::spawn(async move { splitter.run(tx, None, file).await });

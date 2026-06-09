@@ -351,12 +351,10 @@ impl QueueManager {
             // Record stats before sleeping.
             self.stats.record_rate_limited(bytes as u64, sleep_ns);
 
-            // Busy-wait is not ideal, but this is called from sync context.
-            // For a real implementation, this should be async. However, the
-            // dispatch loop in braid_send.rs runs in a tokio::spawn task, so
-            // we can use std::thread::sleep here since the dispatch loop is
-            // the only consumer of this path.
-            std::thread::sleep(sleep_dur);
+            let handle = tokio::runtime::Handle::current();
+            let _ = handle.block_on(tokio::task::spawn_blocking(move || {
+                std::thread::sleep(sleep_dur);
+            }));
 
             // Reset bucket after sleeping — we've waited long enough.
             self.rate_bucket.set(0);

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,7 +90,7 @@ async fn test_shutdown_manager_subscribe() {
 #[tokio::test]
 async fn test_chunk_splitter_creation() {
     let pool = BufferPool::new(2, 1500);
-    let splitter = ChunkSplitter::new(1024, 1500, pool);
+    let splitter = ChunkSplitter::new(Arc::new(AtomicUsize::new(1024)), 1024, 1500, pool);
     assert_eq!(splitter.chunk_size(), 1024);
     assert_eq!(splitter.mtu(), 1500);
     assert!(splitter.fragment_payload_size() > 0);

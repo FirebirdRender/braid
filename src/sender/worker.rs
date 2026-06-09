@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::fd::AsRawFd;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,6 +9,7 @@ use bytes::Bytes;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::timeout;
 
 /// Default kernel send buffer size: 64 MB.
@@ -176,6 +179,384 @@ impl UdpSendWorker {
                     self.send_timeout, self.dest_addr
                 ),
             )),
+        }
+    }
+}
+
+// ─── BatchSendWorker: sendmmsg-based batched sender ─────────────────────────
+
+/// Result of a `sendmmsg_all` call, for the async caller to act on.
+enum SendmmsgResult {
+    Ok,
+    Enosys,
+    WouldBlock,
+    Error(u64),
+}
+
+/// A UDP send worker that accumulates fragments and issues batch sendmmsg
+/// syscalls for higher throughput.
+///
+/// Same public interface as `UdpSendWorker` (`new()`, `bind()`, `run()`), with
+/// the same stats/heartbeat reporting. Falls back to single-datagram sends on
+/// ENOSYS or when batch size is 1.
+pub struct BatchSendWorker {
+    /// Local UDP port to bind to.
+    local_port: u16,
+    /// Destination socket address (IP:port).
+    dest_addr: SocketAddr,
+    /// Kernel send buffer size in bytes (SO_SNDBUF).
+    so_sndbuf: usize,
+    /// Per-datagram send timeout for the fallback path.
+    send_timeout: Duration,
+    /// Maximum datagrams per sendmmsg call.
+    batch_size: usize,
+    /// Maximum wait in microseconds before flushing an incomplete batch.
+    batch_usec: u64,
+    /// Shared statistics.
+    stats: Arc<UdpSendWorkerStats>,
+    /// Channel to report worker lifecycle results to the queue manager.
+    health_tx: Option<mpsc::Sender<WorkerResult>>,
+    /// Runtime ENOSYS detection: starts true, set false on first ENOSYS.
+    support_batch: AtomicBool,
+}
+
+impl BatchSendWorker {
+    /// Create a new `BatchSendWorker` configuration.
+    ///
+    /// The worker is not bound until [`bind`] is called.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        local_port: u16,
+        dest_addr: SocketAddr,
+        so_sndbuf: usize,
+        send_timeout: Duration,
+        batch_size: usize,
+        batch_usec: u64,
+        stats: Arc<UdpSendWorkerStats>,
+        health_tx: Option<mpsc::Sender<WorkerResult>>,
+    ) -> Self {
+        Self {
+            local_port,
+            dest_addr,
+            so_sndbuf,
+            send_timeout,
+            batch_size,
+            batch_usec,
+            stats,
+            health_tx,
+            support_batch: AtomicBool::new(true),
+        }
+    }
+
+    /// Bind the UDP socket with the configured options, then connect it.
+    ///
+    /// Same socket options as `UdpSendWorker::bind()`, plus `connect()` to the
+    /// destination address so that `sendmmsg` can use null `msg_name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding, setting socket options, or connecting fails.
+    pub async fn bind(&self) -> std::io::Result<UdpSocket> {
+        let bind_addr: SocketAddr = ([0, 0, 0, 0], self.local_port).into();
+
+        // Create a socket2 socket for low-level option configuration
+        let domain = if self.dest_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+
+        // Set SO_SNDBUF (kernel send buffer)
+        socket.set_send_buffer_size(self.so_sndbuf)?;
+
+        // Set IP_DONTFRAG / IP_MTU_DISCOVER to detect MTU issues
+        set_df_flag(&socket, self.dest_addr.is_ipv4())?;
+
+        // Enable SO_REUSEADDR for fast restarts
+        socket.set_reuse_address(true)?;
+
+        // Bind to the local address
+        socket.bind(&bind_addr.into())?;
+
+        // Connect the socket so sendmmsg can use null msg_name
+        socket.connect(&self.dest_addr.into())?;
+
+        // Set non-blocking mode before converting to tokio's UdpSocket
+        socket.set_nonblocking(true)?;
+
+        // Convert to tokio's UdpSocket for async I/O
+        let std_udp: std::net::UdpSocket = socket.into();
+        let udp_socket = UdpSocket::from_std(std_udp)?;
+
+        Ok(udp_socket)
+    }
+
+    /// Run the worker: receive fragments from `rx` and send them in batches.
+    ///
+    /// The loop accumulates fragments up to `batch_size`, then flushes via
+    /// `sendmmsg`. If no new fragment arrives within `batch_usec`, the partial
+    /// batch is flushed immediately.
+    ///
+    /// On ENOSYS, the worker falls back atomically to single-datagram sends
+    /// for the remainder of its lifetime.
+    pub async fn run(&self, socket: UdpSocket, mut rx: mpsc::Receiver<Bytes>) {
+        let mut batch: Vec<Bytes> = Vec::with_capacity(self.batch_size);
+
+        loop {
+            // Wait for the first fragment
+            let data = match rx.recv().await {
+                Some(d) => d,
+                None => break, // channel closed
+            };
+            batch.push(data);
+
+            // Accumulate more fragments without blocking (try_recv drain)
+            let burst_start = std::time::Instant::now();
+            let max_wait = Duration::from_micros(self.batch_usec);
+            loop {
+                // Check batch size limit
+                if batch.len() >= self.batch_size {
+                    break;
+                }
+                // Check time limit
+                if burst_start.elapsed() >= max_wait {
+                    break;
+                }
+                match rx.try_recv() {
+                    Ok(data) => {
+                        batch.push(data);
+                    }
+                    Err(TryRecvError::Empty) => {
+                        // No more data right now — yield briefly then retry
+                        // until the time budget expires
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        // Channel closed — flush what we have and exit
+                        self.flush_batch(&socket, &mut batch).await;
+                        if let Some(ref tx) = self.health_tx {
+                            let _ = tx.try_send(WorkerResult::Done);
+                        }
+                        return;
+                    }
+                }
+            }
+
+            // Flush the batch
+            self.flush_batch(&socket, &mut batch).await;
+        }
+
+        // Flush any remaining data
+        if !batch.is_empty() {
+            self.flush_batch(&socket, &mut batch).await;
+        }
+        if let Some(ref tx) = self.health_tx {
+            let _ = tx.try_send(WorkerResult::Done);
+        }
+    }
+
+    /// Flush a batch of fragments via `sendmmsg`, with full rebuild of
+    /// `msgvec`/`iovecs` on each retry attempt (memory safety: pointers
+    /// always point to current `batch` contents).
+    ///
+    /// On `ENOSYS`, atomically disables batching and falls back to
+    /// [`flush_single`]. On `EAGAIN`/`EWOULDBLOCK`, stops and leaves
+    /// remaining data in the batch.
+    async fn flush_batch(&self, socket: &UdpSocket, batch: &mut Vec<Bytes>) {
+        if batch.is_empty() {
+            return;
+        }
+
+        if !self.support_batch.load(Ordering::Relaxed) || self.batch_size <= 1 {
+            self.flush_single(socket, batch).await;
+            return;
+        }
+
+        // Delegate to sync helper: no raw-pointer types cross .await boundaries
+        let fd = socket.as_raw_fd();
+        match Self::sendmmsg_all(fd, batch, self.batch_size, &self.stats, self.local_port) {
+            SendmmsgResult::Ok => {}
+            SendmmsgResult::Enosys => {
+                self.support_batch.store(false, Ordering::Relaxed);
+                self.stats.record_error();
+                eprintln!(
+                    "[BatchSendWorker:{}] sendmmsg not supported (ENOSYS), falling back to single-send",
+                    self.local_port
+                );
+                if let Some(ref tx) = self.health_tx {
+                    let _ = tx.try_send(WorkerResult::Failed);
+                }
+                self.flush_single(socket, batch).await;
+            }
+            SendmmsgResult::WouldBlock => {
+                self.stats.record_error();
+            }
+            SendmmsgResult::Error(count) => {
+                for _ in 0..count {
+                    self.stats.record_error();
+                }
+                if let Some(ref tx) = self.health_tx {
+                    let _ = tx.try_send(WorkerResult::Failed);
+                }
+            }
+        }
+    }
+
+    /// Synchronous sendmmsg loop. Returns how many datagrams were sent via
+    /// batch stats, or a signal for the async caller to handle.
+    ///
+    /// This is a sync fn so that `Vec<libc::iovec>` and `Vec<libc::mmsghdr>`
+    /// (which contain raw pointers and are not `Send`) never cross `.await`
+    /// boundaries in the async state machine.
+    fn sendmmsg_all(
+        fd: std::os::unix::io::RawFd,
+        batch: &mut Vec<Bytes>,
+        batch_size: usize,
+        stats: &UdpSendWorkerStats,
+        _local_port: u16,
+    ) -> SendmmsgResult {
+        let max_retries = 1024;
+        let mut retry_count = 0usize;
+
+        while !batch.is_empty() && retry_count < max_retries {
+            let n_to_send = batch.len().min(batch_size);
+
+            // Rebuild msgvec and iovecs from scratch each attempt.
+            // iov_base pointers reference data owned by the Bytes in `batch`,
+            // which is not mutated or dropped while we hold the `batch` Vec.
+            let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(n_to_send);
+            for data in batch.iter().take(n_to_send) {
+                iovecs.push(libc::iovec {
+                    iov_base: data.as_ptr() as *mut libc::c_void,
+                    iov_len: data.len(),
+                });
+            }
+
+            let mut msgvec: Vec<libc::mmsghdr> = Vec::with_capacity(n_to_send);
+            for iov in iovecs.iter() {
+                msgvec.push(libc::mmsghdr {
+                    msg_hdr: libc::msghdr {
+                        msg_name: ptr::null_mut(),
+                        msg_namelen: 0,
+                        msg_iov: iov as *const libc::iovec as *mut libc::iovec,
+                        msg_iovlen: 1,
+                        msg_control: ptr::null_mut(),
+                        msg_controllen: 0,
+                        msg_flags: 0,
+                    },
+                    msg_len: 0,
+                });
+            }
+
+            // SAFETY: sendmmsg mutates msgvec entries (writes msg_len) but
+            // does not read outside the bounds. iovecs point to valid Bytes
+            // data owned by `batch`. The fd is valid and owned by the socket.
+            let result = unsafe {
+                libc::sendmmsg(fd, msgvec.as_mut_ptr(), n_to_send as u32, libc::MSG_NOSIGNAL)
+            };
+
+            if result == -1 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::ENOSYS) => {
+                        return SendmmsgResult::Enosys;
+                    }
+                    Some(libc::EAGAIN) => { // EAGAIN == EWOULDBLOCK on Linux
+                        return SendmmsgResult::WouldBlock;
+                    }
+                    _ => {
+                        // Unexpected error: drop the first packet and retry
+                        batch.remove(0);
+                        retry_count += 1;
+                    }
+                }
+            } else {
+                let sent = result as usize;
+                for i in 0..sent {
+                    stats.record_send(batch[i].len());
+                }
+                // Drain sent datagrams from the batch front.
+                // This invalidates the pointers in iovecs/msgvec, so we must
+                // NOT use them after this point (we don't — the loop rebuilds).
+                for _ in 0..sent {
+                    batch.remove(0);
+                }
+                retry_count = 0;
+                if sent < n_to_send {
+                    // Partial send — socket is congested, stop
+                    return SendmmsgResult::Ok;
+                }
+            }
+        }
+
+        if !batch.is_empty() && retry_count >= max_retries {
+            let n = batch.len();
+            batch.clear();
+            return SendmmsgResult::Error(n as u64);
+        }
+
+        SendmmsgResult::Ok
+    }
+
+    /// Fallback: send remaining fragments one at a time using
+    /// `socket.try_send()` (connected socket, no per-packet address).
+    ///
+    /// Used when `sendmmsg` returns ENOSYS or when `--no-batch` is in effect.
+    async fn flush_single(&self, socket: &UdpSocket, batch: &mut Vec<Bytes>) {
+        while !batch.is_empty() {
+            let data = &batch[0];
+
+            // Wait for the socket to become writable with a timeout
+            let writable = match timeout(self.send_timeout, socket.writable()).await {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => {
+                    self.stats.record_error();
+                    eprintln!(
+                        "[BatchSendWorker:{}] socket.writable() error: {}",
+                        self.local_port, e
+                    );
+                    batch.remove(0);
+                    continue;
+                }
+                Err(_) => {
+                    self.stats.record_error();
+                    eprintln!(
+                        "[BatchSendWorker:{}] socket.writable() timed out",
+                        self.local_port
+                    );
+                    batch.remove(0);
+                    continue;
+                }
+            };
+
+            if !writable {
+                continue;
+            }
+
+            // try_send (no addr needed — socket is connected)
+            match socket.try_send(data) {
+                Ok(n) => {
+                    self.stats.record_send(n);
+                    batch.remove(0);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Socket not writable yet — loop back to socket.writable()
+                    continue;
+                }
+                Err(e) => {
+                    self.stats.record_error();
+                    eprintln!(
+                        "[BatchSendWorker:{}] try_send error: {}",
+                        self.local_port, e
+                    );
+                    if let Some(ref tx) = self.health_tx {
+                        let _ = tx.try_send(WorkerResult::Failed);
+                    }
+                    batch.remove(0);
+                }
+            }
         }
     }
 }
@@ -471,5 +852,231 @@ mod tests {
         // On a local network, send_to usually completes before the timeout,
         // so this may succeed. We just verify it doesn't panic.
         let _ = result;
+    }
+
+    // ─── BatchSendWorker tests ──────────────────────────────────────────────
+
+    fn make_batch_worker(
+        local_port: u16,
+        dest_addr: SocketAddr,
+    ) -> (BatchSendWorker, Arc<UdpSendWorkerStats>) {
+        let stats = Arc::new(UdpSendWorkerStats::default());
+        let worker = BatchSendWorker::new(
+            local_port,
+            dest_addr,
+            65536, // small buffer for tests
+            Duration::from_secs(1),
+            16,   // batch_size
+            100,  // batch_usec
+            stats.clone(),
+            None, // no health reporting in tests
+        );
+        (worker, stats)
+    }
+
+    #[tokio::test]
+    async fn batch_worker_sends_datagram_to_listener() {
+        let listener = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let (worker, stats) = make_batch_worker(0, listen_addr);
+        let socket = worker.bind().await.unwrap();
+
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
+
+        let handle = tokio::spawn(async move {
+            worker.run(socket, rx).await;
+        });
+
+        let fragment_data: Bytes = Bytes::from(vec![0x50, 0x00, 0x00, 0x0A, 0x01, 0x02, 0x03, 0x04]);
+        tx.send(fragment_data.clone()).await.unwrap();
+        drop(tx);
+
+        handle.await.unwrap();
+
+        let mut buf = vec![0u8; 1500];
+        let (n, _src) = listener.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &fragment_data[..]);
+
+        assert_eq!(stats.fragments_sent.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats.bytes_sent.load(Ordering::Relaxed),
+            fragment_data.len() as u64
+        );
+        assert_eq!(stats.errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_worker_sends_multiple_fragments() {
+        let listener = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let (worker, stats) = make_batch_worker(0, listen_addr);
+        let socket = worker.bind().await.unwrap();
+
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
+
+        let handle = tokio::spawn(async move {
+            worker.run(socket, rx).await;
+        });
+
+        let fragments: Vec<Bytes> = (0..5).map(|i| Bytes::from(vec![i as u8; 100])).collect();
+
+        for frag in &fragments {
+            tx.send(frag.clone()).await.unwrap();
+        }
+        drop(tx);
+
+        handle.await.unwrap();
+
+        for frag in &fragments {
+            let mut buf = vec![0u8; 1500];
+            let (n, _src) = listener.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], &frag[..]);
+        }
+
+        assert_eq!(
+            stats.fragments_sent.load(Ordering::Relaxed),
+            fragments.len() as u64
+        );
+        assert_eq!(stats.errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_worker_terminates_on_channel_close() {
+        let listener = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let (worker, _stats) = make_batch_worker(0, listen_addr);
+        let socket = worker.bind().await.unwrap();
+
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
+        drop(tx);
+
+        let handle = tokio::spawn(async move {
+            worker.run(socket, rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("batch worker should terminate on channel close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_worker_handles_unreachable_destination() {
+        let unreachable_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let (worker, stats) = make_batch_worker(0, unreachable_addr);
+        let socket = worker.bind().await.unwrap();
+
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
+
+        let handle = tokio::spawn(async move {
+            worker.run(socket, rx).await;
+        });
+
+        let fragment_data: Bytes = Bytes::from(vec![0x50, 0x00, 0x00, 0x0A, 0x01, 0x02, 0x03, 0x04]);
+        tx.send(fragment_data).await.unwrap();
+        drop(tx);
+
+        handle.await.unwrap();
+
+        let _ = stats.fragments_sent.load(Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn batch_worker_batch_accumulation() {
+        let listener = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let stats = Arc::new(UdpSendWorkerStats::default());
+        let worker = BatchSendWorker::new(
+            0,
+            listen_addr,
+            65536,
+            Duration::from_secs(1),
+            16,  // batch_size large enough to hold all
+            200, // batch_usec — 200µs window for accumulation
+            stats.clone(),
+            None,
+        );
+        let socket = worker.bind().await.unwrap();
+
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
+
+        let handle = tokio::spawn(async move {
+            worker.run(socket, rx).await;
+        });
+
+        // Send fragments with small delays so they accumulate in the batch
+        let fragments: Vec<Bytes> = (0..3).map(|i| Bytes::from(vec![i as u8; 50])).collect();
+
+        for frag in &fragments {
+            tx.send(frag.clone()).await.unwrap();
+            // Small delay — short enough that all fit within the batch_usec window
+            // but long enough to let try_recv see them
+            tokio::time::sleep(Duration::from_micros(10)).await;
+        }
+        drop(tx);
+
+        handle.await.unwrap();
+
+        // All fragments should have been received
+        for frag in &fragments {
+            let mut buf = vec![0u8; 1500];
+            let (n, _src) = listener.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], &frag[..]);
+        }
+
+        assert_eq!(
+            stats.fragments_sent.load(Ordering::Relaxed),
+            fragments.len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_worker_bind_connects_socket() {
+        let listener = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let (worker, _stats) = make_batch_worker(0, listen_addr);
+        let socket = worker.bind().await.unwrap();
+
+        let local = socket.local_addr().unwrap();
+        assert_ne!(local.port(), 0, "socket should be bound to a port");
+    }
+
+    #[tokio::test]
+    async fn batch_worker_stats_accessible_via_arc() {
+        let listener = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let stats = Arc::new(UdpSendWorkerStats::default());
+        let worker = BatchSendWorker::new(
+            0,
+            listen_addr,
+            65536,
+            Duration::from_secs(1),
+            16,
+            100,
+            stats.clone(),
+            None,
+        );
+        let socket = worker.bind().await.unwrap();
+
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
+
+        let handle = tokio::spawn(async move {
+            worker.run(socket, rx).await;
+        });
+
+        tx.send(Bytes::from(vec![0u8; 50])).await.unwrap();
+        drop(tx);
+
+        handle.await.unwrap();
+
+        assert_eq!(stats.fragments_sent.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 50);
     }
 }
