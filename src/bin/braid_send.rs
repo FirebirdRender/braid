@@ -16,6 +16,7 @@ use braid::file_mode::sender::FileModeSender;
 use braid::flow::SenderReactor;
 use braid::progress::reporter::{ProgressReporter, ProgressVerbosity};
 use braid::protocol::ControlMessage;
+use braid::sender::parallel_splitter::{chunker_worker, Dispatcher, RawChunk, ChunkStats};
 use braid::sender::queue::QueueManagerBuilder;
 use braid::sender::splitter::ChunkSplitter;
 use braid::sender::worker::{BatchSendWorker, UdpSendWorker, UdpSendWorkerStats, WorkerResult};
@@ -76,6 +77,7 @@ pub struct BraidSend {
     batch_size: usize,
     batch_usec: u64,
     no_batch: bool,
+    chunker_threads: usize,
 }
 
 /// Dispatches between BatchSendWorker and UdpSendWorker at creation and spawn time.
@@ -125,6 +127,7 @@ impl BraidSend {
             DEFAULT_BATCH_SIZE,
             DEFAULT_BATCH_USEC,
             false, // no_batch
+            0,     // chunker_threads: 0 = auto
         )
     }
 
@@ -148,6 +151,7 @@ impl BraidSend {
         batch_size: usize,
         batch_usec: u64,
         no_batch: bool,
+        chunker_threads: usize,
     ) -> Self {
         Self {
             destination,
@@ -167,6 +171,7 @@ impl BraidSend {
             batch_size,
             batch_usec,
             no_batch,
+            chunker_threads,
         }
     }
 
@@ -190,6 +195,7 @@ impl BraidSend {
         batch_size: usize,
         batch_usec: u64,
         no_batch: bool,
+        chunker_threads: usize,
     ) -> Self {
         Self {
             destination,
@@ -209,6 +215,7 @@ impl BraidSend {
             batch_size,
             batch_usec,
             no_batch,
+            chunker_threads,
         }
     }
 
@@ -373,9 +380,17 @@ impl BraidSend {
         let progress_bytes_tx = progress.bytes_tx();
         let input_path = self.input.clone();
 
-        // ─── Step 9: Spawn pipeline tasks ────────────────────────────────
-        // Spawn ChunkSplitter
-        // Pool buffer must be large enough for the largest read: max(chunk_size, mtu).
+// ─── Step 9: Spawn pipeline tasks ────────────────────────────────
+        // Determine number of chunker workers.
+        let num_workers: usize = if self.chunker_threads > 0 {
+            self.chunker_threads
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get() / 2)
+                .unwrap_or(1)
+                .max(1)
+        };
+
         let effective_chunk_size = if self.chunk_size > 0 {
             self.chunk_size
         } else {
@@ -384,36 +399,91 @@ impl BraidSend {
         let max_chunk_size = effective_chunk_size.max(braid::adaptive::chunk_size::MAX_CHUNK);
         let pool_buf_size = max_chunk_size.max(self.mtu);
         let chunk_size_atomic = Arc::new(std::sync::atomic::AtomicUsize::new(effective_chunk_size));
-        let splitter_pool = BufferPool::new(4, pool_buf_size);
-        let splitter = ChunkSplitter::new(
-            chunk_size_atomic.clone(),
-            max_chunk_size,
-            self.mtu,
-            splitter_pool,
-        );
+
         let (splitter_pause_tx, splitter_pause_rx) = mpsc::channel::<bool>(16);
-        let splitter_handle = if let Some(file) = file_input {
-            tokio::spawn(async move {
-                info!("chunk splitter started (file input)");
-                if let Err(e) = splitter
-                    .run(fragment_tx, Some(splitter_pause_rx), file)
-                    .await
-                {
-                    error!("chunk splitter error: {}", e);
-                }
-                info!("chunk splitter finished");
-            })
+
+        // Extract values needed by spawned coroutines so they are 'static.
+        let mtu = self.mtu;
+        let fragment_tx_for_workers = fragment_tx.clone();
+
+        let splitter_handle: tokio::task::JoinHandle<()> = if num_workers <= 1 {
+            let splitter_pool = BufferPool::new(4, pool_buf_size);
+            let splitter = ChunkSplitter::new(
+                chunk_size_atomic.clone(),
+                max_chunk_size,
+                mtu,
+                splitter_pool,
+            );
+            if let Some(file) = file_input {
+                tokio::spawn(async move {
+                    info!("chunk splitter started (file input)");
+                    if let Err(e) = splitter.run(fragment_tx, Some(splitter_pause_rx), file).await {
+                        error!("chunk splitter error: {}", e);
+                    }
+                    info!("chunk splitter finished");
+                })
+            } else {
+                tokio::spawn(async move {
+                    info!("chunk splitter started (stdin)");
+                    if let Err(e) = splitter.run(fragment_tx, Some(splitter_pause_rx), tokio::io::stdin()).await {
+                        error!("chunk splitter error: {}", e);
+                    }
+                    info!("chunk splitter finished");
+                })
+            }
         } else {
-            tokio::spawn(async move {
-                info!("chunk splitter started (stdin)");
-                if let Err(e) = splitter
-                    .run(fragment_tx, Some(splitter_pause_rx), tokio::io::stdin())
-                    .await
-                {
-                    error!("chunk splitter error: {}", e);
-                }
-                info!("chunk splitter finished");
-            })
+            let pool = BufferPool::new(num_workers * 2, pool_buf_size);
+            let stats = Arc::new(ChunkStats::default());
+
+            let (work_txs, work_rxs): (Vec<_>, Vec<_>) = (0..num_workers)
+                .map(|_| mpsc::channel::<RawChunk>(64))
+                .unzip();
+
+            // Spawn N chunker workers
+            for rx in work_rxs {
+                let worker_pool = pool.clone();
+                let worker_stats = stats.clone();
+                let worker_fragment_tx = fragment_tx_for_workers.clone();
+                tokio::spawn(async move {
+                    trace!("chunker worker started");
+                    chunker_worker(
+                        mtu,
+                        max_chunk_size,
+                        rx,
+                        worker_fragment_tx,
+                        worker_pool,
+                        worker_stats,
+                    )
+                    .await;
+                    trace!("chunker worker finished");
+                });
+            }
+
+            // Spawn the dispatcher
+            let dispatcher = Dispatcher::new(
+                chunk_size_atomic.clone(),
+                max_chunk_size,
+                mtu,
+                num_workers,
+                work_txs,
+            );
+            if let Some(file) = file_input {
+                tokio::spawn(async move {
+                    info!("dispatcher started (file input)");
+                    if let Err(e) = dispatcher.run(Some(splitter_pause_rx), file).await {
+                        error!("dispatcher error: {}", e);
+                    }
+                    info!("dispatcher finished");
+                })
+            } else {
+                tokio::spawn(async move {
+                    info!("dispatcher started (stdin)");
+                    if let Err(e) = dispatcher.run(Some(splitter_pause_rx), tokio::io::stdin()).await {
+                        error!("dispatcher error: {}", e);
+                    }
+                    info!("dispatcher finished");
+                })
+            }
         };
 
         // Spawn QueueManager dispatch loop.

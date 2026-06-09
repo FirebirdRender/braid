@@ -107,6 +107,10 @@ struct SendArgs {
     /// Disable sendmmsg batching; use single-send per datagram
     #[arg(long, default_value_t = false)]
     no_batch: bool,
+
+    /// Number of parallel chunker threads (0 = auto: num_cpus/2, min 1)
+    #[arg(long, default_value_t = 0)]
+    chunker_threads: usize,
 }
 
 #[derive(Parser, Debug)]
@@ -258,6 +262,7 @@ async fn main() {
                     args.batch_size,
                     args.batch_usec,
                     args.no_batch,
+                    args.chunker_threads,
                 )
             } else {
                 braid_send::BraidSend::new_with_mode(
@@ -274,6 +279,7 @@ async fn main() {
                     args.batch_size,
                     args.batch_usec,
                     args.no_batch,
+                    args.chunker_threads,
                 )
             };
 

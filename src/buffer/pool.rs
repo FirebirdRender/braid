@@ -1,6 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::BytesMut;
+use crossbeam::queue::ArrayQueue;
 use tokio::sync::Semaphore;
 
 #[derive(Clone)]
@@ -10,7 +11,7 @@ pub struct BufferPool {
 
 struct PoolInner {
     storage: Vec<BytesMut>,
-    free_list: Mutex<Vec<usize>>,
+    free_list: ArrayQueue<usize>,
     semaphore: Semaphore,
     buffer_size: usize,
     total_buffers: usize,
@@ -34,8 +35,8 @@ impl PoolBuffer {
 impl Drop for PoolBuffer {
     fn drop(&mut self) {
         self.buffer.resize(self.pool.buffer_size, 0);
-        let mut free_list = self.pool.free_list.lock().unwrap();
-        free_list.push(self.index);
+        // push back to free_list; if full (shouldn't happen with correct sizing), ignore
+        let _ = self.pool.free_list.push(self.index);
         self.pool.semaphore.add_permits(1);
     }
 }
@@ -43,15 +44,16 @@ impl Drop for PoolBuffer {
 impl BufferPool {
     pub fn new(num_buffers: usize, buffer_size: usize) -> Self {
         let mut storage = Vec::with_capacity(num_buffers);
-        let mut free_list = Vec::with_capacity(num_buffers);
+        let free_list = ArrayQueue::new(num_buffers);
         for i in 0..num_buffers {
             storage.push(BytesMut::zeroed(buffer_size));
-            free_list.push(i);
+            // ArrayQueue::push returns Err when full, but we sized it to num_buffers
+            let _ = free_list.push(i);
         }
         Self {
             inner: Arc::new(PoolInner {
                 storage,
-                free_list: Mutex::new(free_list),
+                free_list,
                 semaphore: Semaphore::new(num_buffers),
                 buffer_size,
                 total_buffers: num_buffers,
@@ -66,10 +68,11 @@ impl BufferPool {
             .acquire()
             .await
             .expect("semaphore closed");
-        let index = {
-            let mut free_list = self.inner.free_list.lock().unwrap();
-            free_list.pop().expect("free-list empty despite permit")
-        };
+        let index = self
+            .inner
+            .free_list
+            .pop()
+            .expect("free-list empty despite permit");
         let buffer = self.inner.storage[index].clone();
         permit.forget();
         PoolBuffer {
@@ -90,27 +93,34 @@ impl BufferPool {
             .await
             .expect("semaphore closed");
         let mut buffers = Vec::with_capacity(n);
-        {
-            let mut free_list = self.inner.free_list.lock().unwrap();
-            for _ in 0..n {
-                let index = free_list.pop().expect("free-list empty despite permit");
-                let buffer = self.inner.storage[index].clone();
-                buffers.push(PoolBuffer {
-                    buffer,
-                    index,
-                    pool: Arc::clone(&self.inner),
-                });
-            }
+        for _ in 0..n {
+            let index = self
+                .inner
+                .free_list
+                .pop()
+                .expect("free-list empty despite permit");
+            let buffer = self.inner.storage[index].clone();
+            buffers.push(PoolBuffer {
+                buffer,
+                index,
+                pool: Arc::clone(&self.inner),
+            });
         }
         permit.forget();
         buffers
     }
 
     pub fn used_count(&self) -> usize {
-        self.inner.total_buffers - self.inner.free_list.lock().unwrap().len()
+        self.inner.total_buffers - self.inner.free_list.len()
     }
     pub fn total_count(&self) -> usize {
         self.inner.total_buffers
+    }
+
+    /// Returns a reference to the underlying free list (for crossbeam::ArrayQueue API).
+    /// This is useful for concurrent access patterns.
+    pub fn free_list(&self) -> &ArrayQueue<usize> {
+        &self.inner.free_list
     }
 }
 
