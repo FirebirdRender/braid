@@ -124,70 +124,91 @@ impl FragmentReassembler {
     }
 
     async fn assemble_chunk(&mut self, chunk_id: u64) -> Result<bool, &'static str> {
+        // Read state once before any operations
         let state = self.chunks.get(&chunk_id).ok_or("chunk state not found")?;
 
-        let mut pool_buf = self.pool.acquire().await;
-        pool_buf.buffer.clear();
-        for fi in 0..state.total_fragments as usize {
-            if let Some(ref data) = state.fragments[fi] {
-                pool_buf.buffer.extend_from_slice(&data[FragmentHeader::LEN..]);
+        // Track to-be-removed status: default false, set true only on success
+        let mut should_remove = false;
+        let mut error_reason: Option<&'static str> = None;
+
+        {
+            let mut pool_buf = self.pool.acquire().await;
+            pool_buf.buffer.clear();
+            for fi in 0..state.total_fragments as usize {
+                if let Some(ref data) = state.fragments[fi] {
+                    pool_buf.buffer.extend_from_slice(&data[FragmentHeader::LEN..]);
+                }
+            }
+
+            self.inflight_bytes = self.inflight_bytes.saturating_sub(state.accumulated_bytes);
+
+            let assembled = &pool_buf.buffer;
+            if assembled.len() < ChunkHeader::LEN {
+                error_reason = Some("reassembled data too short for chunk header");
+            } else {
+                let chunk_header = ChunkHeader::try_from(&assembled[..ChunkHeader::LEN])?;
+                let wire_data_len = chunk_header.payload_length as usize;
+                let seq = chunk_header.sequence_number;
+                let crc = chunk_header.chunk_crc;
+                let flags = chunk_header.flags;
+
+                if assembled.len() - ChunkHeader::LEN != wire_data_len {
+                    error_reason = Some("chunk payload length mismatch");
+                } else {
+                    let wire_data = &assembled[ChunkHeader::LEN..];
+                    let decompressed: Option<Vec<u8>> = if flags == COMPRESSED_LZ4 {
+                        match decompress_lz4(wire_data) {
+                            Ok(data) => Some(data),
+                            Err(_) => {
+                                error_reason = Some("decompression failed");
+                                None
+                            }
+                        }
+                    } else {
+                        Some(wire_data.to_vec())
+                    };
+
+                    if let Some(decompressed) = decompressed {
+                        let crc_ok = verify_chunk_crc(seq, &decompressed, crc);
+                        if !crc_ok {
+                            warn!(
+                                "chunk CRC mismatch: chunk_id={}, sequence_number={}",
+                                chunk_id, seq
+                            );
+                            error_reason = Some("chunk CRC mismatch");
+                        } else {
+                            let mut payload = Vec::with_capacity(ChunkHeader::LEN + decompressed.len());
+                            payload.extend_from_slice(&assembled[..ChunkHeader::LEN]);
+                            payload.extend_from_slice(&decompressed);
+
+                            match self.tx.send(Bytes::from(payload)).await {
+                                Ok(()) => {
+                                    debug!(
+                                        "chunk emitted: chunk_id={}, sequence_number={}, size={}",
+                                        chunk_id, seq, decompressed.len()
+                                    );
+                                    should_remove = true;
+                                }
+                                Err(_) => {
+                                    warn!("output channel closed, dropping chunk {}", chunk_id);
+                                    error_reason = Some("output channel closed");
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        self.inflight_bytes = self.inflight_bytes.saturating_sub(state.accumulated_bytes);
-
-        let assembled = &pool_buf.buffer;
-        if assembled.len() < ChunkHeader::LEN {
-            return Err("reassembled data too short for chunk header");
-        }
-
-        let chunk_header = ChunkHeader::try_from(&assembled[..ChunkHeader::LEN])?;
-        let wire_data_len = chunk_header.payload_length as usize;
-        let seq = chunk_header.sequence_number;
-        let crc = chunk_header.chunk_crc;
-        let flags = chunk_header.flags;
-
-        if assembled.len() - ChunkHeader::LEN != wire_data_len {
-            return Err("chunk payload length mismatch");
-        }
-
-        let wire_data = &assembled[ChunkHeader::LEN..];
-        let decompressed = if flags == COMPRESSED_LZ4 {
-            match decompress_lz4(wire_data) {
-                Ok(data) => data,
-                Err(_) => return Err("decompression failed"),
-            }
+        // CRITICAL: Remove completed chunk state to prevent unbounded HashMap growth.
+        // This must run for ALL successful completions (only should_remove=true),
+        // NOT for any error path. Error paths leave state in HashMap (intentionally).
+        // For 20GB leak, the issue is likely: channel buffers filling up, NOT this HashMap.
+        if should_remove {
+            self.chunks.remove(&chunk_id);
+            Ok(true)
         } else {
-            wire_data.to_vec()
-        };
-
-        let crc_ok = verify_chunk_crc(seq, &decompressed, crc);
-        if !crc_ok {
-            warn!(
-                "chunk CRC mismatch: chunk_id={}, sequence_number={}",
-                chunk_id, seq
-            );
-            return Err("chunk CRC mismatch");
-        }
-
-        let mut payload = Vec::with_capacity(ChunkHeader::LEN + decompressed.len());
-        payload.extend_from_slice(&assembled[..ChunkHeader::LEN]);
-        payload.extend_from_slice(&decompressed);
-
-        match self.tx.send(Bytes::from(payload)).await {
-            Ok(()) => {
-                debug!(
-                    "chunk emitted: chunk_id={}, sequence_number={}, size={}",
-                    chunk_id,
-                    seq,
-                    decompressed.len()
-                );
-                Ok(true)
-            }
-            Err(_) => {
-                warn!("output channel closed, dropping chunk {}", chunk_id);
-                Err("output channel closed")
-            }
+            Err(error_reason.unwrap_or("unknown error"))
         }
     }
 
