@@ -577,7 +577,7 @@ impl BraidReceive {
                                     pool_buf.buffer[3],
                                 ]);
                                 let shard = (chunk_id as usize) % nw;
-                                let fragment = pool_buf.split_to(n).freeze();
+let fragment = Bytes::copy_from_slice(&pool_buf.buffer[..n]);
                                 if txs[shard].send(fragment).await.is_err() {
                                     break;
                                 }
