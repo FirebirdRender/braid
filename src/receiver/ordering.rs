@@ -179,20 +179,13 @@ impl ChunkOrderer {
     }
 
     fn try_emit(&mut self) {
-        loop {
-            let chunk_seq = match self.heap.peek() {
-                Some(peeked) => {
-                    let seq = peeked.0.sequence_number;
-                    if seq != self.next_expected_seq {
-                        break;
-                    }
-                    seq
-                }
-                None => break,
-            };
+        while let Some(peeked) = self.heap.peek() {
+            let chunk_seq = peeked.0.sequence_number;
+            if chunk_seq != self.next_expected_seq {
+                break;
+            }
 
             let (chunk_crc, data) = {
-                let peeked = self.heap.peek().unwrap();
                 let payload = &peeked.0.payload;
                 let chunk_crc = if payload.len() >= ChunkHeader::LEN {
                     u32::from_be_bytes([

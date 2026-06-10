@@ -158,9 +158,8 @@ impl FragmentReassembler {
 
         let mut emitted = false;
         for id in ids {
-            match self.assemble_chunk(id).await {
-                Ok(true) => emitted = true,
-                _ => {} // still stuck or error, try again later
+            if let Ok(true) = self.assemble_chunk(id).await {
+                emitted = true;
             }
         }
         emitted
@@ -774,7 +773,7 @@ let mut reassembler = make_reassembler(tx, 50, 60);
         let (fragments, original) = build_compressed_fragments(0, data, 1500);
 
         for fragment in fragments {
-            let completed = reassembler.add_fragment(Bytes::from(fragment)).await.unwrap();
+            let completed = reassembler.add_fragment(fragment).await.unwrap();
             if completed {
                 break;
             }
@@ -794,7 +793,7 @@ let mut reassembler = make_reassembler(tx, 50, 60);
         let fragments = build_fragments(0, data, 1500);
 
         for fragment in fragments {
-            let completed = reassembler.add_fragment(Bytes::from(fragment)).await.unwrap();
+            let completed = reassembler.add_fragment(fragment).await.unwrap();
             if completed {
                 break;
             }
@@ -830,7 +829,7 @@ let mut reassembler = make_reassembler(tx, 50, 60);
         }
 
         for fragment in fragments {
-            let result = reassembler.add_fragment(Bytes::from(fragment)).await;
+            let result = reassembler.add_fragment(fragment).await;
             if let Err(msg) = result {
                 assert_eq!(msg, "decompression failed");
                 return;
