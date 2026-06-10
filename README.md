@@ -267,6 +267,18 @@ src/
 └── error/                 # Error types
 ```
 
+## v0.6.0 Features
+
+### Receiver Backpressure Wiring
+
+v0.6.0 completes the end-to-end backpressure chain from receiver pipeline pressure to sender splitter:
+
+- **Receiver-driven flow control**: Receiver monitors send `QueueStatus` messages with actual byte occupancy and total capacity over the TCP control channel
+- **SenderReactor pause/resume**: Sender's `SenderReactor` computes flow levels (Green/Yellow/Orange/Red) and sends pause/resume signals on Orange+/Red transitions
+- **Merge governor**: Combines local backpressure (QueueManager) and remote backpressure (SenderReactor) using `tokio::select! { biased; }` for deterministic ordering
+- **Capacity synchronization**: `total_capacity` field added to `QueueStatus` protocol, sender `FlowController` updates on first status message
+- **Full backpressure chain**: Receiver pipeline pressure → QueueStatus → TCP control → SenderReactor → merge governor → splitter pause → stdin backpressure
+
 ## v0.5.0 Features
 
 ### sendmmsg Batch Send

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-10
+
+### Added
+
+- **Receiver backpressure wiring**: Full end-to-end backpressure from receiver pipeline to sender splitter
+- **Merge governor**: Combines local backpressure (QueueManager) with remote backpressure (ReceiverMonitor) via `local_paused || remote_paused` logic
+- **Flow control pause channel**: `flow_pause_tx/rx` mpsc channel between `SenderReactor` and splitter merge governor
+- **Capacity synchronization**: `total_capacity` field in `QueueStatus` protocol message, sender updates `FlowController` capacity on first status message
+
+### Changed
+
+- `SenderReactor` now sends pause/resume signals on Orange/Red/Green fullness level transitions
+- `ReceiverMonitor` sends actual `total_capacity` in `QueueStatus` messages instead of placeholder
+- Merge governor uses `tokio::select! { biased; }` for deterministic ordering between local and remote pause sources
+
 ## [0.5.0] - 2026-06-09
 
 ### Added
