@@ -316,11 +316,10 @@ pub async fn chunker_worker(
             batch.push(fragment.freeze());
 
             // Send batch when full
-            if batch.len() >= DEFAULT_BATCH_SIZE {
-                if result_tx.send(std::mem::take(&mut batch)).await.is_err() {
+            if batch.len() >= DEFAULT_BATCH_SIZE
+                && result_tx.send(std::mem::take(&mut batch)).await.is_err() {
                     return; // Receiver dropped (QueueManager channel closed)
                 }
-            }
         }
 
         // Track bytes processed
@@ -403,16 +402,14 @@ mod tests {
         });
 
         // Send chunks
-        let mut chunk_id = 0u64;
-        for chunk_data in input.chunks(chunk_size) {
+        for (chunk_id, chunk_data) in input.chunks(chunk_size).enumerate() {
             let _ = work_tx
                 .send(RawChunk {
-                    chunk_id,
+                    chunk_id: chunk_id as u64,
                     data: chunk_data.to_vec(),
                     is_last: false,
                 })
                 .await;
-            chunk_id += 1;
         }
         // Drop sender to signal EOS
         drop(work_tx);

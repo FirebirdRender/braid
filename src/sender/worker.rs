@@ -474,8 +474,8 @@ impl BatchSendWorker {
                 }
             } else {
                 let sent = result as usize;
-                for i in 0..sent {
-                    stats.record_send(batch[i].len());
+                for frag in batch.iter().take(sent) {
+                    stats.record_send(frag.len());
                 }
                 // Drain sent datagrams from the batch front.
                 // This invalidates the pointers in iovecs/msgvec, so we must
