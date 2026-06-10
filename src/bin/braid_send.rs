@@ -809,7 +809,7 @@ impl BraidSend {
             // Create new UDP send workers.
             let mut new_worker_sockets = Vec::with_capacity(new_channels.len());
             for (_channel_id, port) in &new_channels {
-                let dest = SocketAddr::new(self.destination.ip(), *port as u16);
+                let dest = SocketAddr::new(self.destination.ip(), *port);
                 let worker: WorkerKind = if self.no_batch {
                     WorkerKind::Single(UdpSendWorker::new(
                         0,

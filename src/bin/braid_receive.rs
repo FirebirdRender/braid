@@ -264,7 +264,7 @@ impl BraidReceive {
 
                     let result = tokio::time::timeout(
                         Duration::from_secs(1),
-                        socket.recv_from(&mut *pool_buf.buffer),
+                        socket.recv_from(&mut pool_buf.buffer),
                     )
                     .await;
 
@@ -587,7 +587,7 @@ let fragment = Bytes::copy_from_slice(&pool_buf.buffer[..n]);
                         let mut pool_buf = pool.acquire().await;
                         let result = tokio::time::timeout(
                             Duration::from_secs(1),
-                            socket.recv_from(&mut *pool_buf.buffer),
+                            socket.recv_from(&mut pool_buf.buffer),
                         )
                         .await;
                         match result {
