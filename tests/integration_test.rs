@@ -478,10 +478,7 @@ fn run_loopback(data: &[u8], timeout_secs: u64) -> Vec<u8> {
     let _ = recv_child.wait();
 
     // Read the output file
-    let received = match std::fs::read(&output_path) {
-        Ok(d) => d,
-        Err(_) => Vec::new(),
-    };
+    let received: Vec<u8> = std::fs::read(&output_path).unwrap_or_default();
 
     // Cleanup
     let _ = std::fs::remove_file(&output_path);
@@ -561,9 +558,9 @@ fn test_varied_pattern_data() {
     // Alternating patterns to exercise different chunk boundaries
     let mut data = Vec::with_capacity(500000);
     // Pattern 1: all zeros
-    data.extend(std::iter::repeat(0u8).take(100000));
+    data.extend(std::iter::repeat_n(0u8, 100000));
     // Pattern 2: all 0xFF
-    data.extend(std::iter::repeat(0xFFu8).take(100000));
+    data.extend(std::iter::repeat_n(0xFFu8, 100000));
     // Pattern 3: incrementing bytes
     data.extend((0..100000).map(|i| (i % 256) as u8));
     // Pattern 4: random-looking pattern

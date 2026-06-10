@@ -233,10 +233,7 @@ fn run_loopback(data: &[u8], control_port: u16, timeout_secs: u64) -> Vec<u8> {
     let _ = recv_child.wait();
 
     // Read the output file
-    let received = match std::fs::read(&output_path) {
-        Ok(d) => d,
-        Err(_) => Vec::new(),
-    };
+    let received: Vec<u8> = std::fs::read(&output_path).unwrap_or_default();
 
     // Cleanup
     let _ = std::fs::remove_file(&output_path);
@@ -615,7 +612,7 @@ async fn test_crc_integrity() {
 
     let fragment_payload_size = 1500 - FragmentHeader::LEN;
     let total_fragments =
-        ((chunk_buf.len() + fragment_payload_size - 1) / fragment_payload_size) as u16;
+        chunk_buf.len().div_ceil(fragment_payload_size) as u16;
 
     for fragment_index in 0..total_fragments {
         let start = fragment_index as usize * fragment_payload_size;
@@ -638,7 +635,7 @@ async fn test_crc_integrity() {
         if fragment_index + 1 == total_fragments {
             assert_eq!(result.unwrap_err(), "chunk CRC mismatch");
         } else {
-            assert_eq!(result.unwrap(), false);
+            assert!(!result.unwrap());
         }
     }
 }

@@ -193,7 +193,7 @@ fn run_loopback_with_tc(data: &[u8], _timeout_secs: u64, _tc: Option<&TcGuard>) 
 
     let mut send_child = send_cmd.spawn().expect("failed to spawn sender");
     if let Some(mut stdin) = send_child.stdin.take() {
-        stdin.write_all(&data).expect("failed to write stdin");
+        stdin.write_all(data).expect("failed to write stdin");
         drop(stdin);
     }
 
