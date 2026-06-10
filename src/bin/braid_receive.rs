@@ -23,10 +23,16 @@ use braid::shutdown::manager::ShutdownManager;
 use super::Mode;
 
 const DEFAULT_CHUNK_TIMEOUT_SECS: u64 = 60;
-/// Large channel capacity to absorb burst rates between sender and receiver.
-const DEFAULT_CHANNEL_CAPACITY: usize = 32_768;
 const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Per-payload-channel capacity derived from `--buffer-size` to bound memory.
+fn compute_payload_channel_capacity(max_inflight: usize, num_channels: usize) -> usize {
+    let pool_buffers = (max_inflight / 65_536).max(16);
+    let channels = num_channels.max(1);
+    let per_channel = ((pool_buffers * 2) / channels).max(64);
+    per_channel.min(4096)
+}
 
 pub struct BraidReceive {
     bind: SocketAddr,
@@ -171,16 +177,23 @@ impl BraidReceive {
             (None, Some(conn))
         };
 
-        let (reassembly_tx, reassembly_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CAPACITY);
-        info!("CHANNEL_CAPACITY: chan=reassembly_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
-        let (orderer_tx, orderer_rx) = mpsc::channel::<CommitGateInput>(DEFAULT_CHANNEL_CAPACITY);
-        info!("CHANNEL_CAPACITY: chan=orderer_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
+        let num_workers = udp_sockets.len();
+        let channel_cap = compute_payload_channel_capacity(max_inflight, num_workers);
+        info!(
+            "channel capacities: max_inflight={}, num_workers={}, channel_cap={}",
+            max_inflight, num_workers, channel_cap
+        );
+
+        let (reassembly_tx, reassembly_rx) = mpsc::channel::<Bytes>(channel_cap);
+        info!("CHANNEL_CAPACITY: chan=reassembly_tx cap={}", channel_cap);
+        let (orderer_tx, orderer_rx) = mpsc::channel::<CommitGateInput>(channel_cap);
+        info!("CHANNEL_CAPACITY: chan=orderer_tx cap={}", channel_cap);
         let (control_tx, mut control_rx) =
-            mpsc::channel::<braid::protocol::ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
-        info!("CHANNEL_CAPACITY: chan=control_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
+            mpsc::channel::<braid::protocol::ControlMessage>(channel_cap);
+        info!("CHANNEL_CAPACITY: chan=control_tx cap={}", channel_cap);
         let (queue_status_tx, mut queue_status_rx) =
-            mpsc::channel::<braid::protocol::ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
-        info!("CHANNEL_CAPACITY: chan=queue_status_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
+            mpsc::channel::<braid::protocol::ControlMessage>(channel_cap);
+        info!("CHANNEL_CAPACITY: chan=queue_status_tx cap={}", channel_cap);
 
         let mut orderer = ChunkOrderer::new(orderer_tx, 0);
         let mut commit_gate = if let Some((_, ref output_path, _)) = file_mode_state {
@@ -214,19 +227,16 @@ impl BraidReceive {
 
         commit_gate.set_progress_bytes(progress_counter);
 
-        let num_workers = udp_sockets.len();
-
         // N fragment channels: each UDP worker routes fragments to the correct
         // reassembler by chunk_id % N. This distributes CRC+reassembly across
         // cores regardless of which worker receives which packet.
         let mut fragment_txs: Vec<mpsc::Sender<Bytes>> = Vec::with_capacity(num_workers);
         let mut fragment_rxs: Vec<mpsc::Receiver<Bytes>> = Vec::with_capacity(num_workers);
         for worker_idx in 0..num_workers {
-            let (tx, rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CAPACITY);
+            let (tx, rx) = mpsc::channel::<Bytes>(channel_cap);
             info!(
                 "CHANNEL_CAPACITY: chan=fragment_tx_{} cap={}",
-                worker_idx,
-                DEFAULT_CHANNEL_CAPACITY
+                worker_idx, channel_cap
             );
             fragment_txs.push(tx);
             fragment_rxs.push(rx);
@@ -391,11 +401,11 @@ let fragment = Bytes::copy_from_slice(&pool_buf.buffer[..n]);
         // When the reconnect handler needs to send Ack/ChannelOpened, it sends
         // via reconnect_out_tx which the forward loop relays on the TCP connection.
         let (reconnect_tx, mut reconnect_rx) =
-            mpsc::channel::<ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
-        info!("CHANNEL_CAPACITY: chan=reconnect_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
+            mpsc::channel::<ControlMessage>(channel_cap);
+        info!("CHANNEL_CAPACITY: chan=reconnect_tx cap={}", channel_cap);
         let (reconnect_out_tx, mut reconnect_out_rx) =
-            mpsc::channel::<ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
-        info!("CHANNEL_CAPACITY: chan=reconnect_out_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
+            mpsc::channel::<ControlMessage>(channel_cap);
+        info!("CHANNEL_CAPACITY: chan=reconnect_out_tx cap={}", channel_cap);
 
         // Forward: bidirectional TCP forwarding over the control connection.
         // In file mode, conn stays in the main scope for post-EOS FileComplete.
@@ -908,5 +918,47 @@ mod tests {
             monitor.controller().level(),
             braid::flow::FullnessLevel::Green
         );
+    }
+
+    // ── compute_payload_channel_capacity tests ──────────────────────────
+
+    #[test]
+    fn capacity_256k_four_channels() {
+        let cap = compute_payload_channel_capacity(262_144, 4);
+        assert!(cap >= 64, "expected >= 64, got {cap}");
+        assert!(cap <= 4096, "expected <= 4096, got {cap}");
+    }
+
+    #[test]
+    fn capacity_1m_four_channels() {
+        let cap = compute_payload_channel_capacity(1_048_576, 4);
+        assert!(cap >= 64, "expected >= 64, got {cap}");
+        assert!(
+            cap <= 128,
+            "expected bounded (64-128) for 1M/4ch, got {cap}"
+        );
+    }
+
+    #[test]
+    fn capacity_64m_four_channels() {
+        let cap = compute_payload_channel_capacity(67_108_864, 4);
+        assert!(
+            cap > 64,
+            "expected enough slack (>64) for 64M/4ch, got {cap}"
+        );
+        assert!(cap <= 4096, "expected <= 4096, got {cap}");
+    }
+
+    #[test]
+    fn capacity_zero_channels_fallback() {
+        let cap = compute_payload_channel_capacity(262_144, 0);
+        assert!(cap >= 64, "expected >= 64 with zero channels, got {cap}");
+        assert!(cap <= 4096, "expected <= 4096, got {cap}");
+    }
+
+    #[test]
+    fn capacity_huge_buffer_capped() {
+        let cap = compute_payload_channel_capacity(1_073_741_824, 1);
+        assert_eq!(cap, 4096, "expected cap at 4096 for 1G/1ch, got {cap}");
     }
 }
