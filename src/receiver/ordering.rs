@@ -194,6 +194,8 @@ impl ChunkOrderer {
     pub async fn push_chunk(&mut self, payload: Bytes) -> ChunkOrdererStats {
         let seq = parse_sequence_number(&payload);
 
+        debug!("ORDERER_HEAP: seq={} heap_size={}", seq, self.heap.len());
+
         self.stats.chunks_received += 1;
 
         self.heap.push(Reverse(OrderedChunk {

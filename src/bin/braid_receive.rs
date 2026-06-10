@@ -172,11 +172,15 @@ impl BraidReceive {
         };
 
         let (reassembly_tx, reassembly_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CAPACITY);
+        info!("CHANNEL_CAPACITY: chan=reassembly_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
         let (orderer_tx, orderer_rx) = mpsc::channel::<CommitGateInput>(DEFAULT_CHANNEL_CAPACITY);
+        info!("CHANNEL_CAPACITY: chan=orderer_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
         let (control_tx, mut control_rx) =
             mpsc::channel::<braid::protocol::ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
+        info!("CHANNEL_CAPACITY: chan=control_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
         let (queue_status_tx, mut queue_status_rx) =
             mpsc::channel::<braid::protocol::ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
+        info!("CHANNEL_CAPACITY: chan=queue_status_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
 
         let mut orderer = ChunkOrderer::new(orderer_tx, 0);
         let mut commit_gate = if let Some((_, ref output_path, _)) = file_mode_state {
@@ -217,8 +221,13 @@ impl BraidReceive {
         // cores regardless of which worker receives which packet.
         let mut fragment_txs: Vec<mpsc::Sender<Bytes>> = Vec::with_capacity(num_workers);
         let mut fragment_rxs: Vec<mpsc::Receiver<Bytes>> = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
+        for worker_idx in 0..num_workers {
             let (tx, rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CAPACITY);
+            info!(
+                "CHANNEL_CAPACITY: chan=fragment_tx_{} cap={}",
+                worker_idx,
+                DEFAULT_CHANNEL_CAPACITY
+            );
             fragment_txs.push(tx);
             fragment_rxs.push(rx);
         }
@@ -383,8 +392,10 @@ let fragment = Bytes::copy_from_slice(&pool_buf.buffer[..n]);
         // via reconnect_out_tx which the forward loop relays on the TCP connection.
         let (reconnect_tx, mut reconnect_rx) =
             mpsc::channel::<ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
+        info!("CHANNEL_CAPACITY: chan=reconnect_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
         let (reconnect_out_tx, mut reconnect_out_rx) =
             mpsc::channel::<ControlMessage>(DEFAULT_CHANNEL_CAPACITY);
+        info!("CHANNEL_CAPACITY: chan=reconnect_out_tx cap={}", DEFAULT_CHANNEL_CAPACITY);
 
         // Forward: bidirectional TCP forwarding over the control connection.
         // In file mode, conn stays in the main scope for post-EOS FileComplete.

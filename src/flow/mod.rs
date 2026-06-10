@@ -365,11 +365,11 @@ impl ReceiverMonitor {
         let occupancy = self.buffer_pool.used_count();
         let (level, changed) = self.controller.update_occupancy(occupancy);
 
-        debug!(
-            "buffer fullness: {}/{} ({:.1}%) level={:?} changed={}",
+        info!(
+            "FLOW_METRIC: occupancy={}, capacity={}, ratio={:.6}, level={:?}, changed={}",
             occupancy,
             self.total_capacity,
-            self.controller.fullness_ratio() * 100.0,
+            self.controller.fullness_ratio(),
             level,
             changed,
         );
