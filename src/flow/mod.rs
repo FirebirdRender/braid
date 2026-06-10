@@ -256,6 +256,11 @@ impl FlowController {
         self.total_capacity
     }
 
+    /// Update total_capacity at runtime (called when first QueueStatus arrives).
+    pub fn set_total_capacity(&mut self, capacity: usize) {
+        self.total_capacity = capacity;
+    }
+
     /// Returns a reference to the flow stats.
     pub fn stats(&self) -> &Arc<FlowStats> {
         &self.stats
