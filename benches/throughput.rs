@@ -13,6 +13,8 @@
 //! Compare: iperf3 -c 127.0.0.1 -t 30 -p 5201
 
 use std::hint::black_box;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -166,7 +168,7 @@ fn bench_splitter_fragment_construction(c: &mut Criterion) {
         chunk_buf.extend_from_slice(&chunk_header.to_bytes());
         chunk_buf.extend_from_slice(&payload);
 
-        let total_fragments = (chunk_buf.len() + frag_payload_size - 1) / frag_payload_size;
+        let total_fragments = chunk_buf.len().div_ceil(frag_payload_size);
 
         group.throughput(Throughput::Bytes(chunk_size as u64));
         group.bench_with_input(
@@ -221,7 +223,7 @@ fn bench_reassembly(c: &mut Criterion) {
         chunk_buf.extend_from_slice(&payload);
 
         // Build all fragments
-        let total_fragments = (chunk_buf.len() + frag_payload_size - 1) / frag_payload_size;
+        let total_fragments = chunk_buf.len().div_ceil(frag_payload_size);
         let fragments: Vec<Vec<u8>> = (0..total_fragments)
             .map(|fi| {
                 let start = fi * frag_payload_size;
@@ -251,7 +253,7 @@ fn bench_reassembly(c: &mut Criterion) {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     let (tx, _rx) = tokio::sync::mpsc::channel(16);
                     let pool = BufferPool::new(128, 65536);
-                    let mut reassembler = FragmentReassembler::new(tx, 10 * 1024 * 1024, 60, pool);
+                    let mut reassembler = FragmentReassembler::new(tx, 10 * 1024 * 1024, 60, pool, Arc::new(AtomicUsize::new(0)));
                     for frag in frags {
                         let completed = rt
                             .block_on(reassembler.add_fragment(black_box(Bytes::from(
@@ -283,7 +285,7 @@ fn bench_reassembly_out_of_order(c: &mut Criterion) {
     chunk_buf.extend_from_slice(&chunk_header.to_bytes());
     chunk_buf.extend_from_slice(&payload);
 
-    let total_fragments = (chunk_buf.len() + frag_payload_size - 1) / frag_payload_size;
+    let total_fragments = chunk_buf.len().div_ceil(frag_payload_size);
     let mut fragments: Vec<Vec<u8>> = (0..total_fragments)
         .map(|fi| {
             let start = fi * frag_payload_size;
@@ -313,7 +315,7 @@ fn bench_reassembly_out_of_order(c: &mut Criterion) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let (tx, _rx) = tokio::sync::mpsc::channel(16);
             let pool = BufferPool::new(128, 65536);
-            let mut reassembler = FragmentReassembler::new(tx, 10 * 1024 * 1024, 60, pool);
+            let mut reassembler = FragmentReassembler::new(tx, 10 * 1024 * 1024, 60, pool, Arc::new(AtomicUsize::new(0)));
             for frag in &fragments {
                 let completed = rt
                     .block_on(reassembler.add_fragment(black_box(Bytes::from(frag.clone()))))
@@ -485,7 +487,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
             chunk_buf.extend_from_slice(&chunk_header.to_bytes());
             chunk_buf.extend_from_slice(payload);
 
-            let total_fragments = (chunk_buf.len() + frag_payload_size - 1) / frag_payload_size;
+            let total_fragments = chunk_buf.len().div_ceil(frag_payload_size);
             for fi in 0..total_fragments {
                 let fstart = fi * frag_payload_size;
                 let fend = std::cmp::min(fstart + frag_payload_size, chunk_buf.len());
@@ -514,9 +516,9 @@ fn bench_full_pipeline(c: &mut Criterion) {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
                     let pool = BufferPool::new(256, 65536);
-                    let mut reassembler =
-                        FragmentReassembler::new(tx, 10 * 1024 * 1024, 60, pool);
-
+let mut reassembler =
+                        FragmentReassembler::new(tx, 10 * 1024 * 1024, 60, pool, Arc::new(AtomicUsize::new(0)));
+ 
                     let mut total_reassembled = 0usize;
                     for frag in frags {
                         let frag_bytes = Bytes::from(frag.clone());
