@@ -75,6 +75,7 @@ pub enum ControlMessage {
     QueueStatus {
         queued_chunks: u32,
         queued_bytes: u32,
+        total_capacity: u32,
     },
     ChannelOpened {
         channel_id: u16,
@@ -120,7 +121,7 @@ impl ControlMessage {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = BytesMut::new();
+        let mut buf = BytesMut::with_capacity(1 + 4 + 4 + 4);
         buf.put_u8(self.kind() as u8);
         match self {
             Self::Hello {
@@ -161,9 +162,12 @@ impl ControlMessage {
             Self::QueueStatus {
                 queued_chunks,
                 queued_bytes,
+                total_capacity,
+
             } => {
                 buf.put_u32(*queued_chunks);
                 buf.put_u32(*queued_bytes);
+                buf.put_u32(*total_capacity);
             }
             Self::ChannelOpened { channel_id, port } => {
                 buf.put_u16(*channel_id);
@@ -241,6 +245,7 @@ impl TryFrom<&[u8]> for ControlMessage {
             ControlMessageKind::QueueStatus => Self::QueueStatus {
                 queued_chunks: buf.get_u32(),
                 queued_bytes: buf.get_u32(),
+                total_capacity: buf.get_u32(),
             },
             ControlMessageKind::ChannelOpened => Self::ChannelOpened {
                 channel_id: buf.get_u16(),
@@ -327,10 +332,12 @@ impl fmt::Display for ControlMessage {
             Self::QueueStatus {
                 queued_chunks,
                 queued_bytes,
+                total_capacity,
+
             } => write!(
                 f,
-                "QUEUE_STATUS(queued_chunks={}, queued_bytes={})",
-                queued_chunks, queued_bytes
+                "QUEUE_STATUS(chunks={}, bytes={}, capacity={})",
+                queued_chunks, queued_bytes, total_capacity
             ),
             Self::ChannelOpened { channel_id, port } => write!(
                 f,

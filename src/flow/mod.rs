@@ -25,14 +25,13 @@
 //! - [`ReceiverMonitor`]: Monitors buffer pool fullness, sends QUEUE_STATUS.
 //! - [`SenderReactor`]: Receives QUEUE_STATUS, applies backpressure actions.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::buffer::BufferPool;
 use crate::protocol::ControlMessage;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -303,8 +302,6 @@ impl FlowController {
 /// 2. Sends a [`ControlMessage::QueueStatus`] with queued_chunks and queued_bytes.
 /// 3. Updates the local [`FlowController`] state.
 pub struct ReceiverMonitor {
-    /// Buffer pool to monitor.
-    buffer_pool: BufferPool,
     /// Total capacity of the buffer pool.
     total_capacity: usize,
     /// Flow controller for tracking fullness state.
@@ -313,27 +310,30 @@ pub struct ReceiverMonitor {
     control_tx: mpsc::Sender<ControlMessage>,
     /// Interval between status reports.
     status_interval: Duration,
+    /// Total bytes in-flight across all FragmentReassemblers.
+    /// Used instead of buffer_pool.used_count() for accurate pipeline memory measurement.
+    receiver_bytes: Arc<AtomicUsize>,
 }
 
 impl ReceiverMonitor {
     /// Create a new `ReceiverMonitor`.
     ///
-    /// * `buffer_pool` - The buffer pool to monitor.
     /// * `total_capacity` - Total capacity of the buffer pool (in items or bytes).
     /// * `control_tx` - Channel to send control messages to the sender.
     /// * `status_interval` - How often to send QUEUE_STATUS messages.
+    /// * `receiver_bytes` - Shared atomic tracking total bytes in FragmentReassemblers.
     pub fn new(
-        buffer_pool: BufferPool,
         total_capacity: usize,
         control_tx: mpsc::Sender<ControlMessage>,
         status_interval: Duration,
+        receiver_bytes: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            buffer_pool,
             total_capacity,
             controller: FlowController::new(total_capacity),
             control_tx,
             status_interval,
+            receiver_bytes,
         }
     }
 
@@ -360,18 +360,41 @@ impl ReceiverMonitor {
         }
     }
 
+    /// Read current RSS (resident set size) from /proc/self/status.
+    fn read_rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|line| {
+                    if line.starts_with("VmRSS:") {
+                        line.split_whitespace()
+                            .nth(1)
+                            .and_then(|v| v.parse::<u64>().ok())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(0)
+    }
+
     /// Check buffer fullness and send QUEUE_STATUS if needed.
     async fn check_and_report(&mut self) {
-        let occupancy = self.buffer_pool.used_count();
+        // Track actual pipeline bytes in-flight across all FragmentReassemblers
+        // instead of buffer_pool.used_count(). The buffer pool only has ~16 buffers
+        // and is never a bottleneck — pipeline memory is in the reassembler HashMaps.
+        let occupancy = self.receiver_bytes.load(Ordering::Relaxed);
         let (level, changed) = self.controller.update_occupancy(occupancy);
+        let rss_kb = Self::read_rss_kb();
 
         info!(
-            "FLOW_METRIC: occupancy={}, capacity={}, ratio={:.6}, level={:?}, changed={}",
+            "FLOW_METRIC: occupancy={}, capacity={}, ratio={:.6}, level={:?}, changed={} rss_mb={}",
             occupancy,
             self.total_capacity,
             self.controller.fullness_ratio(),
             level,
             changed,
+            rss_kb / 1024,
         );
 
         // Build QUEUE_STATUS message
@@ -381,6 +404,7 @@ impl ReceiverMonitor {
         let msg = ControlMessage::QueueStatus {
             queued_chunks,
             queued_bytes,
+            total_capacity: self.total_capacity as u32,
         };
 
         match self.control_tx.send(msg).await {
@@ -461,6 +485,7 @@ impl SenderReactor {
             ControlMessage::QueueStatus {
                 queued_chunks,
                 queued_bytes,
+                total_capacity: _,
             } => {
                 self.controller.stats.record_status_received();
                 self.handle_queue_status(queued_chunks as usize, queued_bytes as usize)
@@ -752,15 +777,15 @@ mod tests {
 
     #[tokio::test]
     async fn receiver_monitor_sends_queue_status() {
-        let pool = BufferPool::new(10, 1024);
         let (control_tx, mut control_rx) = mpsc::channel(16);
         let (cancel_tx, cancel_rx) = mpsc::channel(1);
+        let receiver_bytes = Arc::new(AtomicUsize::new(0));
 
         let mut monitor = ReceiverMonitor::new(
-            pool,
             10,
             control_tx,
             Duration::from_millis(50), // Fast interval for testing
+            receiver_bytes,
         );
 
         // Spawn the monitor
@@ -778,6 +803,7 @@ mod tests {
             ControlMessage::QueueStatus {
                 queued_chunks,
                 queued_bytes: _,
+                total_capacity: _,
             } => {
                 assert_eq!(queued_chunks, 0); // Pool is empty
             }
@@ -791,15 +817,15 @@ mod tests {
 
     #[tokio::test]
     async fn receiver_monitor_stops_on_cancel() {
-        let pool = BufferPool::new(10, 1024);
         let (control_tx, _control_rx) = mpsc::channel(16);
         let (cancel_tx, cancel_rx) = mpsc::channel(1);
+        let receiver_bytes = Arc::new(AtomicUsize::new(0));
 
         let mut monitor = ReceiverMonitor::new(
-            pool,
             10,
             control_tx,
             Duration::from_secs(3600), // Very long interval
+            receiver_bytes,
         );
 
         let handle = tokio::spawn(async move {
@@ -831,6 +857,7 @@ mod tests {
                 .send(ControlMessage::QueueStatus {
                     queued_chunks: 85,
                     queued_bytes: 85,
+                    total_capacity: 100,
                 })
                 .await
                 .ok();
@@ -839,6 +866,7 @@ mod tests {
                 .send(ControlMessage::QueueStatus {
                     queued_chunks: 30,
                     queued_bytes: 30,
+                    total_capacity: 100,
                 })
                 .await
                 .ok();
@@ -867,6 +895,7 @@ mod tests {
                 .send(ControlMessage::QueueStatus {
                     queued_chunks: 60,
                     queued_bytes: 60,
+                    total_capacity: 100,
                 })
                 .await
                 .ok();
@@ -892,6 +921,7 @@ mod tests {
                 .send(ControlMessage::QueueStatus {
                     queued_chunks: 96,
                     queued_bytes: 96,
+                    total_capacity: 100,
                 })
                 .await
                 .ok();
@@ -946,6 +976,7 @@ mod tests {
                 .send(ControlMessage::QueueStatus {
                     queued_chunks: 10,
                     queued_bytes: 10,
+                    total_capacity: 100,
                 })
                 .await
                 .ok();
@@ -954,6 +985,7 @@ mod tests {
                 .send(ControlMessage::QueueStatus {
                     queued_chunks: 60,
                     queued_bytes: 60,
+                    total_capacity: 100,
                 })
                 .await
                 .ok();
@@ -962,6 +994,7 @@ mod tests {
                 .send(ControlMessage::QueueStatus {
                     queued_chunks: 85,
                     queued_bytes: 85,
+                    total_capacity: 100,
                 })
                 .await
                 .ok();
@@ -970,6 +1003,7 @@ mod tests {
                 .send(ControlMessage::QueueStatus {
                     queued_chunks: 96,
                     queued_bytes: 96,
+                    total_capacity: 100,
                 })
                 .await
                 .ok();
@@ -978,6 +1012,7 @@ mod tests {
                 .send(ControlMessage::QueueStatus {
                     queued_chunks: 30,
                     queued_bytes: 30,
+                    total_capacity: 100,
                 })
                 .await
                 .ok();
@@ -1019,6 +1054,7 @@ mod tests {
                 .send(ControlMessage::QueueStatus {
                     queued_chunks: 600,
                     queued_bytes: 600,
+                    total_capacity: 1000,
                 })
                 .await
                 .ok();

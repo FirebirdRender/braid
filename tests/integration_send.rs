@@ -290,6 +290,7 @@ async fn test_flow_control_wiring() {
         .send(braid::protocol::ControlMessage::QueueStatus {
             queued_chunks: 60,
             queued_bytes: 60,
+            total_capacity: 100,
         })
         .await
         .ok();

@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -58,7 +60,7 @@ async fn test_buffer_pool_creation() {
 #[tokio::test]
 async fn test_fragment_reassembler_creation() {
     let (tx, _rx) = tokio::sync::mpsc::channel::<Bytes>(16);
-    let reassembler = FragmentReassembler::new(tx, 1024 * 1024, 60, BufferPool::new(4, 65536));
+    let reassembler = FragmentReassembler::new(tx, 1024 * 1024, 60, BufferPool::new(4, 65536), Arc::new(AtomicUsize::new(0)));
     assert_eq!(reassembler.in_flight_count(), 0);
     assert_eq!(reassembler.inflight_bytes(), 0);
 }
@@ -91,9 +93,8 @@ async fn test_progress_reporter_creation() {
 
 #[tokio::test]
 async fn test_receiver_monitor_creation() {
-    let pool = BufferPool::new(10, 1024);
     let (control_tx, _control_rx) = tokio::sync::mpsc::channel(16);
-    let monitor = ReceiverMonitor::new(pool, 10, control_tx, Duration::from_secs(1));
+    let monitor = ReceiverMonitor::new(10, control_tx, Duration::from_secs(1), Arc::new(AtomicUsize::new(0)));
     assert_eq!(
         monitor.controller().level(),
         braid::flow::FullnessLevel::Green
@@ -105,7 +106,8 @@ async fn test_reassembly_to_orderer_pipeline() {
     let (reassembly_tx, mut reassembly_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     let (orderer_tx, mut orderer_rx) = tokio::sync::mpsc::channel::<CommitGateInput>(16);
 
-    let mut reassembler = FragmentReassembler::new(reassembly_tx, 1024 * 1024, 60, BufferPool::new(4, 65536));
+    let receiver_bytes = Arc::new(AtomicUsize::new(0));
+    let mut reassembler = FragmentReassembler::new(reassembly_tx, 1024 * 1024, 60, BufferPool::new(4, 65536), receiver_bytes);
     let mut orderer = ChunkOrderer::new(orderer_tx, 0);
 
     use braid::protocol::crc::compute_chunk_crc;
@@ -139,7 +141,7 @@ async fn test_reassembly_to_orderer_pipeline() {
     );
 
     let reassembled = reassembly_rx.recv().await.unwrap();
-    orderer.push_chunk(reassembled).await;
+    orderer.push_chunk(reassembled);
 
     let ordered = orderer_rx.recv().await.unwrap();
     assert_eq!(ordered.data, data);
@@ -185,7 +187,8 @@ async fn test_full_pipeline_reassembly_to_commit() {
     let (reassembly_tx, mut reassembly_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     let (orderer_tx, orderer_rx) = tokio::sync::mpsc::channel::<CommitGateInput>(16);
 
-    let mut reassembler = FragmentReassembler::new(reassembly_tx, 1024 * 1024, 60, BufferPool::new(4, 65536));
+    let receiver_bytes = Arc::new(AtomicUsize::new(0));
+    let mut reassembler = FragmentReassembler::new(reassembly_tx, 1024 * 1024, 60, BufferPool::new(4, 65536), receiver_bytes);
     let mut orderer = ChunkOrderer::new(orderer_tx, 0);
     let mut gate = CommitGate::new(orderer_rx);
 
@@ -225,7 +228,7 @@ async fn test_full_pipeline_reassembly_to_commit() {
         assert!(completed);
 
         let reassembled = reassembly_rx.recv().await.unwrap();
-        orderer.push_chunk(reassembled).await;
+        orderer.push_chunk(reassembled);
     }
 
     drop(orderer);
@@ -245,11 +248,10 @@ async fn test_full_pipeline_reassembly_to_commit() {
 
 #[tokio::test]
 async fn test_receiver_monitor_sends_queue_status() {
-    let pool = BufferPool::new(10, 1024);
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(16);
     let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(1);
 
-    let mut monitor = ReceiverMonitor::new(pool, 10, control_tx, Duration::from_millis(50));
+    let mut monitor = ReceiverMonitor::new(10, control_tx, Duration::from_millis(50), Arc::new(AtomicUsize::new(0)));
 
     let handle = tokio::spawn(async move {
         monitor.run(cancel_rx).await;
@@ -264,6 +266,7 @@ async fn test_receiver_monitor_sends_queue_status() {
         braid::protocol::ControlMessage::QueueStatus {
             queued_chunks,
             queued_bytes: _,
+            total_capacity: _,
         } => {
             assert_eq!(queued_chunks, 0);
         }
