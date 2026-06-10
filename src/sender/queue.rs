@@ -473,8 +473,8 @@ impl QueueManager {
     }
 
     /// Check whether all active workers exceed the high-watermark and signal
-    /// backpressure if so.
-    fn check_backpressure(&self) {
+    /// backpressure if so. Also signals resume when backpressure clears.
+    pub fn check_backpressure(&self) {
         let active_count = self.active_worker_count();
         if active_count == 0 {
             return;
@@ -488,6 +488,8 @@ impl QueueManager {
 
         if all_exceed {
             self.signal_pause();
+        } else {
+            self.signal_resume();
         }
     }
 }
@@ -814,9 +816,12 @@ mod tests {
 
         mgr.check_backpressure();
 
-        // Should NOT receive a pause signal
+        // Should receive a resume signal (false) since not all workers exceed watermark
         let result = tokio::time::timeout(Duration::from_millis(200), bp_rx.recv()).await;
-        assert!(result.is_err(), "should not receive backpressure signal");
+        let sig = result
+            .expect("check_backpressure should send a signal quickly")
+            .expect("bp_tx should not be closed");
+        assert!(!sig, "should receive false (resume) signal");
 
         drop(receivers);
     }

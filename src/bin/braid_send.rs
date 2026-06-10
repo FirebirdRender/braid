@@ -500,6 +500,13 @@ impl BraidSend {
             let mut rx = fragment_rx;
             let mut exit_reason = QmExitReason::Normal;
 
+            // Periodic backpressure check: when the splitter is paused, no
+            // dispatch_batch calls happen, so check_backpressure() never fires
+            // the resume signal even after workers drain. This timer polls
+            // backpressure periodically to un-stick the splitter.
+            let mut bp_check = tokio::time::interval(std::time::Duration::from_millis(100));
+            bp_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
             // Merge all health_rx channels into a single receiver.
             let (health_merge_tx, mut health_merge_rx) = mpsc::channel::<(usize, braid::sender::worker::WorkerResult)>(128);
             for (i, mut hrx) in health_rxs.into_iter().enumerate() {
@@ -551,6 +558,9 @@ impl BraidSend {
                                 trace!("health merge channel closed");
                             }
                         }
+                    }
+                    _ = bp_check.tick() => {
+                        queue_manager.check_backpressure();
                     }
                 }
             }
@@ -899,13 +909,27 @@ impl BraidSend {
             let new_qm_handle = tokio::spawn(async move {
                 info!("reconnect queue manager dispatch loop started");
                 let mut rx = new_fragment_rx;
-                while let Some(batch) = rx.recv().await {
-                    if new_qm_shutdown.is_shutting_down() {
-                        break;
-                    }
-                    if let Err(e) = new_queue_manager.dispatch_batch(batch) {
-                        error!("reconnect queue manager dispatch_batch error: {}", e);
-                        break;
+                let mut bp_check = tokio::time::interval(std::time::Duration::from_millis(100));
+                bp_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        batch = rx.recv() => {
+                            match batch {
+                                Some(batch) => {
+                                    if new_qm_shutdown.is_shutting_down() {
+                                        break;
+                                    }
+                                    if let Err(e) = new_queue_manager.dispatch_batch(batch) {
+                                        error!("reconnect queue manager dispatch_batch error: {}", e);
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = bp_check.tick() => {
+                            new_queue_manager.check_backpressure();
+                        }
                     }
                 }
                 info!("reconnect queue manager dispatch loop finished");
