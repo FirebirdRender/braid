@@ -3,10 +3,19 @@ use std::collections::BinaryHeap;
 use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, trace};
 
 use crate::protocol::headers::ChunkHeader;
 use crate::receiver::commit::CommitGateInput;
+
+/// Maximum number of chunks allowed in the heap before force-emitting the oldest.
+///
+/// When a gap (missing sequence number) blocks emission and the output channel
+/// has capacity, chunks accumulate in the heap. This threshold ensures bounded
+/// heap growth by force-emitting the oldest chunk (breaking order) so the
+/// pipeline can drain. 512 chunks at 262KB each ≈ 134MB worst case.
+const HEAP_HIGH_WATERMARK: usize = 512;
 
 /// A chunk queued in the min-heap, ordered by sequence number.
 #[derive(Debug, Eq, PartialEq)]
@@ -92,13 +101,19 @@ impl ChunkOrderer {
         gap_timeout: Option<Duration>,
     ) {
         let mut ticker = gap_timeout.map(|d| tokio::time::interval(d));
+        let mut status_ticker = tokio::time::interval(Duration::from_secs(5));
+        status_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let recv_fut = rx.recv();
             tokio::select! {
+                _ = status_ticker.tick() => {
+                    debug!("ORDERER_STATUS: heap={} next_seq={} emitted={}",
+                        self.heap.len(), self.next_expected_seq, self.stats.chunks_emitted);
+                }
                 payload = recv_fut => {
                     match payload {
                         Some(payload) => {
-                            self.push_chunk(payload).await;
+                            self.push_chunk(payload);
                         }
                         None => {
                             debug!(
@@ -117,84 +132,21 @@ impl ChunkOrderer {
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    // Gap timeout tick — check if we should force-emit the oldest chunk
                     if !self.heap.is_empty() {
                         debug!(
                             "gap timeout: {} chunks waiting in heap, oldest seq={}",
                             self.heap.len(),
                             self.heap.peek().map(|r| r.0.sequence_number).unwrap_or(0)
                         );
-                        // Force-emit the oldest chunk to prevent unbounded memory
-                        self.force_emit_oldest().await;
+                        self.force_emit_oldest();
                     }
                 }
             }
         }
     }
 
-    async fn force_emit_oldest(&mut self) {
-        if let Some(Reverse(chunk)) = self.heap.pop() {
-            let seq = chunk.sequence_number;
-            let payload = chunk.payload;
-            trace!("force-emitting chunk {} (gap timeout)", seq);
-            Self::emit_chunk(&self.tx, seq, payload, &mut self.stats).await;
-            if seq >= self.next_expected_seq {
-                self.next_expected_seq = seq.wrapping_add(1);
-            }
-            self.try_emit().await;
-        }
-    }
-
-    fn prepare_input(seq: u64, mut payload: Vec<u8>) -> CommitGateInput {
-        let chunk_crc = if payload.len() >= ChunkHeader::LEN {
-            u32::from_be_bytes([payload[12], payload[13], payload[14], payload[15]])
-        } else {
-            0
-        };
-
-        let data: Bytes = if payload.len() > ChunkHeader::LEN {
-            let data_len = payload.len() - ChunkHeader::LEN;
-            payload.copy_within(ChunkHeader::LEN.., 0);
-            // SAFETY: data_len < original len, and we just copied those bytes to [0..data_len)
-            unsafe {
-                payload.set_len(data_len);
-            }
-            Bytes::from(payload)
-        } else {
-            Bytes::new()
-        };
-
-        CommitGateInput {
-            data,
-            sequence_number: seq,
-            chunk_crc,
-        }
-    }
-
-    async fn emit_chunk(
-        tx: &tokio::sync::mpsc::Sender<CommitGateInput>,
-        seq: u64,
-        payload: Vec<u8>,
-        stats: &mut ChunkOrdererStats,
-    ) -> bool {
-        let input = Self::prepare_input(seq, payload);
-
-        match tx.send(input).await {
-            Ok(()) => {
-                stats.chunks_emitted += 1;
-                true
-            }
-            Err(tokio::sync::mpsc::error::SendError(_)) => {
-                debug!("output channel closed, dropping chunk {}", seq);
-                false
-            }
-        }
-    }
-
-    pub async fn push_chunk(&mut self, payload: Bytes) -> ChunkOrdererStats {
+    pub fn push_chunk(&mut self, payload: Bytes) -> ChunkOrdererStats {
         let seq = parse_sequence_number(&payload);
-
-        debug!("ORDERER_HEAP: seq={} heap_size={}", seq, self.heap.len());
 
         self.stats.chunks_received += 1;
 
@@ -203,66 +155,129 @@ impl ChunkOrderer {
             payload: payload.to_vec(),
         }));
 
+        debug!("ORDERER_HEAP: seq={} heap_size={}", seq, self.heap.len());
+
         trace!(
             "chunk {} pushed to heap (waiting: {})",
             seq,
             self.heap.len()
         );
 
-        self.try_emit().await;
+        self.try_emit();
+
+        // If the heap exceeds the high watermark, force-emit the oldest chunk
+        // to prevent unbounded growth from gaps (missing sequence numbers).
+        if self.heap.len() > HEAP_HIGH_WATERMARK {
+            debug!(
+                "heap high watermark reached ({} chunks), force-emitting oldest",
+                self.heap.len()
+            );
+            self.force_emit_oldest();
+        }
 
         self.stats()
     }
 
-    async fn try_emit(&mut self) {
-        while let Some(Reverse(c)) = self.heap.peek() {
-            let smallest_seq = c.sequence_number;
-
-            if smallest_seq != self.next_expected_seq {
-                trace!(
-                    "gap at seq {} (heap top: {}), waiting",
-                    self.next_expected_seq,
-                    smallest_seq
-                );
-                break;
-            }
-
-            let Reverse(chunk) = self.heap.pop().unwrap();
-            let seq = chunk.sequence_number;
-
-            let data: Bytes = chunk.payload[ChunkHeader::LEN..].to_vec().into();
-            let chunk_crc = if chunk.payload.len() >= ChunkHeader::LEN {
-                u32::from_be_bytes([
-                    chunk.payload[12],
-                    chunk.payload[13],
-                    chunk.payload[14],
-                    chunk.payload[15],
-                ])
-            } else {
-                0
+    fn try_emit(&mut self) {
+        loop {
+            let chunk_seq = match self.heap.peek() {
+                Some(peeked) => {
+                    let seq = peeked.0.sequence_number;
+                    if seq != self.next_expected_seq {
+                        break;
+                    }
+                    seq
+                }
+                None => break,
             };
+
+            let (chunk_crc, data) = {
+                let peeked = self.heap.peek().unwrap();
+                let payload = &peeked.0.payload;
+                let chunk_crc = if payload.len() >= ChunkHeader::LEN {
+                    u32::from_be_bytes([
+                        payload[12], payload[13], payload[14], payload[15],
+                    ])
+                } else {
+                    0
+                };
+                let data: Bytes = if payload.len() > ChunkHeader::LEN {
+                    Bytes::copy_from_slice(&payload[ChunkHeader::LEN..])
+                } else {
+                    Bytes::new()
+                };
+                (chunk_crc, data)
+            };
+
             let input = CommitGateInput {
                 data,
-                sequence_number: seq,
+                sequence_number: chunk_seq,
                 chunk_crc,
             };
 
-            match self.tx.send(input).await {
+            match self.tx.try_send(input) {
                 Ok(()) => {
+                    self.heap.pop();
                     self.stats.chunks_emitted += 1;
-                    self.next_expected_seq = seq.wrapping_add(1);
+                    self.next_expected_seq = chunk_seq.wrapping_add(1);
                     debug!(
                         "chunk {} emitted (next expected: {}, waiting: {})",
-                        seq,
+                        chunk_seq,
                         self.next_expected_seq,
                         self.heap.len()
                     );
                 }
-                Err(tokio::sync::mpsc::error::SendError(_)) => {
-                    debug!("output channel closed, dropping chunk {}", seq);
+                Err(TrySendError::Full(_)) => break,
+                Err(TrySendError::Closed(_)) => {
+                    debug!("output channel closed, stopping emit");
                     break;
                 }
             }
+        }
+    }
+
+    fn force_emit_oldest(&mut self) {
+        let (seq, chunk_crc, data) = match self.heap.peek() {
+            Some(peeked) => {
+                let seq = peeked.0.sequence_number;
+                let payload = &peeked.0.payload;
+                let chunk_crc = if payload.len() >= ChunkHeader::LEN {
+                    u32::from_be_bytes([
+                        payload[12], payload[13], payload[14], payload[15],
+                    ])
+                } else {
+                    0
+                };
+                let data: Bytes = if payload.len() > ChunkHeader::LEN {
+                    Bytes::copy_from_slice(&payload[ChunkHeader::LEN..])
+                } else {
+                    Bytes::new()
+                };
+                (seq, chunk_crc, data)
+            }
+            None => return,
+        };
+
+        let input = CommitGateInput {
+            data,
+            sequence_number: seq,
+            chunk_crc,
+        };
+
+        match self.tx.try_send(input) {
+            Ok(()) => {
+                self.heap.pop();
+                self.stats.chunks_emitted += 1;
+                if seq >= self.next_expected_seq {
+                    self.next_expected_seq = seq.wrapping_add(1);
+                }
+                trace!("force-emitted chunk {} (gap timeout)", seq);
+                self.try_emit();
+            }
+            Err(TrySendError::Full(_)) => {
+                debug!("force_emit_oldest: channel full, chunk {} stays in heap", seq);
+            }
+            Err(TrySendError::Closed(_)) => {}
         }
     }
 
@@ -297,6 +312,7 @@ impl ChunkOrderer {
                 chunk_crc,
             };
 
+            // drain_all is only called at shutdown — blocking send is acceptable
             if self.tx.send(input).await.is_err() {
                 debug!("output channel closed during drain, stopping");
                 break;
@@ -373,7 +389,7 @@ mod tests {
 
         let chunks = build_chunks(0, 5, 0xAA);
         for chunk in &chunks {
-            orderer.push_chunk(chunk.clone()).await;
+            orderer.push_chunk(chunk.clone());
         }
 
         let mut emitted = Vec::new();
@@ -397,7 +413,7 @@ mod tests {
         let indices = vec![1usize, 2, 0, 4, 3];
 
         for &i in &indices {
-            orderer.push_chunk(chunks[i].clone()).await;
+            orderer.push_chunk(chunks[i].clone());
         }
 
         let mut emitted = Vec::new();
@@ -419,14 +435,14 @@ mod tests {
 
         let chunks = build_chunks(0, 4, 0xCC);
 
-        orderer.push_chunk(chunks[1].clone()).await;
-        orderer.push_chunk(chunks[2].clone()).await;
-        orderer.push_chunk(chunks[3].clone()).await;
+        orderer.push_chunk(chunks[1].clone());
+        orderer.push_chunk(chunks[2].clone());
+        orderer.push_chunk(chunks[3].clone());
 
         assert_eq!(orderer.stats().chunks_emitted, 0);
         assert_eq!(orderer.stats().chunks_waiting, 3);
 
-        orderer.push_chunk(chunks[0].clone()).await;
+        orderer.push_chunk(chunks[0].clone());
 
         let stats = orderer.stats();
         assert_eq!(stats.chunks_received, 4);
@@ -452,15 +468,15 @@ mod tests {
 
         let chunks = build_chunks(0, 6, 0xDD);
 
-        orderer.push_chunk(chunks[2].clone()).await;
-        orderer.push_chunk(chunks[3].clone()).await;
-        orderer.push_chunk(chunks[4].clone()).await;
-        orderer.push_chunk(chunks[5].clone()).await;
+        orderer.push_chunk(chunks[2].clone());
+        orderer.push_chunk(chunks[3].clone());
+        orderer.push_chunk(chunks[4].clone());
+        orderer.push_chunk(chunks[5].clone());
 
         assert_eq!(orderer.stats().chunks_emitted, 0);
         assert_eq!(orderer.stats().chunks_waiting, 4);
 
-        orderer.push_chunk(chunks[0].clone()).await;
+        orderer.push_chunk(chunks[0].clone());
 
         let stats = orderer.stats();
         assert_eq!(stats.chunks_emitted, 1);
@@ -470,7 +486,7 @@ mod tests {
         assert_eq!(emitted0.data, vec![0xDD; 16]);
         assert_eq!(emitted0.sequence_number, 0);
 
-        orderer.push_chunk(chunks[1].clone()).await;
+        orderer.push_chunk(chunks[1].clone());
 
         let stats = orderer.stats();
         assert_eq!(stats.chunks_emitted, 6);
@@ -490,12 +506,12 @@ mod tests {
 
         let chunks = build_chunks(0, 2, 0xEE);
 
-        let stats = orderer.push_chunk(chunks[1].clone()).await;
+        let stats = orderer.push_chunk(chunks[1].clone());
         assert_eq!(stats.chunks_received, 1);
         assert_eq!(stats.chunks_emitted, 0);
         assert_eq!(stats.chunks_waiting, 1);
 
-        let stats = orderer.push_chunk(chunks[0].clone()).await;
+        let stats = orderer.push_chunk(chunks[0].clone());
         assert_eq!(stats.chunks_received, 2);
         assert_eq!(stats.chunks_emitted, 2);
         assert_eq!(stats.chunks_waiting, 0);
@@ -507,7 +523,7 @@ mod tests {
         let mut orderer = ChunkOrderer::new(tx, 0);
 
         let chunk = build_chunk(0, b"");
-        orderer.push_chunk(chunk).await;
+        orderer.push_chunk(chunk);
 
         let emitted = rx.recv().await.unwrap();
         assert!(emitted.data.is_empty());
@@ -520,9 +536,9 @@ mod tests {
         let mut orderer = ChunkOrderer::new(tx, 100);
 
         let chunks = build_chunks(100, 3, 0x10);
-        orderer.push_chunk(chunks[0].clone()).await;
-        orderer.push_chunk(chunks[1].clone()).await;
-        orderer.push_chunk(chunks[2].clone()).await;
+        orderer.push_chunk(chunks[0].clone());
+        orderer.push_chunk(chunks[1].clone());
+        orderer.push_chunk(chunks[2].clone());
 
         let mut emitted = Vec::new();
         for _ in 0..3 {
@@ -623,37 +639,31 @@ mod tests {
         assert_eq!(emitted[1].sequence_number, 2);
     }
 
-    /// Verifies that a chunk orderer with a small output channel properly
-    /// blocks when the channel is full, without losing any data.
-    ///
-    /// This test creates an orderer with a small output channel,
-    /// pushes chunks until the channel fills, and verifies the
-    /// orderer blocks (backpressure) rather than dropping data.
+    /// Verifies that push_chunk does not block when the output channel is full.
+    /// With non-blocking try_send, chunks accumulate in the heap until
+    /// channel capacity becomes available.
     #[tokio::test]
-    async fn test_blocking_send_propagates_backpressure() {
+    async fn non_blocking_send_accumulates_in_heap() {
         let (tx, rx) = mpsc::channel::<CommitGateInput>(1);
         let mut orderer = ChunkOrderer::new(tx, 0);
 
-        // Push chunk 0 — should emit to channel (has capacity)
-        let chunks = build_chunks(0, 2, 0x7F);
-        orderer.push_chunk(chunks[0].clone()).await;
+        let chunks = build_chunks(0, 3, 0x7F);
 
+        orderer.push_chunk(chunks[0].clone());
         let stats = orderer.stats();
-        assert_eq!(stats.chunks_emitted, 1, "chunk 0 should be emitted");
+        assert_eq!(stats.chunks_emitted, 1, "chunk 0 emitted");
+        assert_eq!(stats.chunks_waiting, 0);
 
-        // Push chunk 1 — try_emit will block because channel is full (capacity 1, rx not consumed)
-        let blocked = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            orderer.push_chunk(chunks[1].clone()),
-        )
-        .await;
+        orderer.push_chunk(chunks[1].clone());
+        let stats = orderer.stats();
+        assert_eq!(stats.chunks_emitted, 1, "chunk 1 blocked by full channel");
+        assert_eq!(stats.chunks_waiting, 1, "chunk 1 stays in heap");
 
-        assert!(
-            blocked.is_err(),
-            "push_chunk should block when output channel is full"
-        );
+        orderer.push_chunk(chunks[2].clone());
+        let stats = orderer.stats();
+        assert_eq!(stats.chunks_emitted, 1, "chunk 2 also blocked");
+        assert_eq!(stats.chunks_waiting, 2, "chunks 1 and 2 in heap");
 
-        // Cleanup: drop rx to unblock any pending send
         drop(rx);
     }
 }

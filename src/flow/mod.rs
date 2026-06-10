@@ -289,9 +289,9 @@ impl FlowController {
         self.current_level.is_critical()
     }
 
-    /// Returns true if normal operation should resume (dropped below 50%).
+    /// Returns true if normal operation should resume (level is Green).
     pub fn should_resume(&self) -> bool {
-        self.current_level == FullnessLevel::Green && self.prev_level != FullnessLevel::Green
+        self.current_level == FullnessLevel::Green
     }
 }
 
@@ -453,6 +453,9 @@ pub struct SenderReactor {
     controller: FlowController,
     /// Channel to receive QUEUE_STATUS messages from the receiver.
     control_rx: mpsc::Receiver<ControlMessage>,
+    /// Channel to send pause/resume signals to the splitter.
+    /// `true` = pause sending, `false` = resume sending.
+    flow_pause_tx: Option<mpsc::Sender<bool>>,
 }
 
 impl SenderReactor {
@@ -460,10 +463,16 @@ impl SenderReactor {
     ///
     /// * `total_capacity` - Total buffer pool capacity (must match receiver).
     /// * `control_rx` - Channel to receive QUEUE_STATUS messages.
-    pub fn new(total_capacity: usize, control_rx: mpsc::Receiver<ControlMessage>) -> Self {
+    /// * `flow_pause_tx` - Optional channel to send pause/resume signals to the splitter.
+    pub fn new(
+        total_capacity: usize,
+        control_rx: mpsc::Receiver<ControlMessage>,
+        flow_pause_tx: Option<mpsc::Sender<bool>>,
+    ) -> Self {
         Self {
             controller: FlowController::new(total_capacity),
             control_rx,
+            flow_pause_tx,
         }
     }
 
@@ -519,6 +528,7 @@ impl SenderReactor {
                 // Normal operation — resume if we were paused
                 if changed && self.controller.prev_level().is_severe() {
                     info!("flow: green zone — resuming normal operation");
+                    self.flow_pause_tx.as_ref().map(|tx| tx.try_send(false));
                 }
             }
             FullnessLevel::Yellow => {
@@ -532,6 +542,7 @@ impl SenderReactor {
                 // Pause chunk splitting (backpressure to stdin)
                 if changed {
                     info!("flow: orange zone — pausing chunk splitting");
+                    self.flow_pause_tx.as_ref().map(|tx| tx.try_send(true));
                 }
             }
             FullnessLevel::Red => {
@@ -539,6 +550,7 @@ impl SenderReactor {
                 if changed {
                     warn!("flow: RED zone — pausing ALL sending, sending NACK");
                     self.controller.stats.record_nack();
+                    self.flow_pause_tx.as_ref().map(|tx| tx.try_send(true));
                 }
             }
         }
@@ -853,7 +865,7 @@ mod tests {
     async fn sender_reactor_green_resumes_sending() {
         let (control_tx, control_rx) = mpsc::channel(16);
 
-        let mut reactor = SenderReactor::new(100, control_rx);
+        let mut reactor = SenderReactor::new(100, control_rx, None);
 
         // First put it into orange, then green
         let handle = tokio::spawn(async move {
@@ -893,7 +905,7 @@ mod tests {
     async fn sender_reactor_yellow_sends_multiplier() {
         let (control_tx, control_rx) = mpsc::channel(16);
 
-        let mut reactor = SenderReactor::new(100, control_rx);
+        let mut reactor = SenderReactor::new(100, control_rx, None);
 
         let handle = tokio::spawn(async move {
             control_tx
@@ -919,7 +931,7 @@ mod tests {
     async fn sender_reactor_red_sends_nack_and_pause() {
         let (control_tx, control_rx) = mpsc::channel(16);
 
-        let mut reactor = SenderReactor::new(100, control_rx);
+        let mut reactor = SenderReactor::new(100, control_rx, None);
 
         let handle = tokio::spawn(async move {
             control_tx
@@ -945,7 +957,7 @@ mod tests {
     async fn sender_reactor_ignores_non_queue_status() {
         let (control_tx, control_rx) = mpsc::channel(16);
 
-        let mut reactor = SenderReactor::new(100, control_rx);
+        let mut reactor = SenderReactor::new(100, control_rx, None);
 
         let handle = tokio::spawn(async move {
             // Send a non-queue-status message
@@ -973,7 +985,7 @@ mod tests {
     async fn full_cycle_green_to_red_to_green() {
         let (control_tx, control_rx) = mpsc::channel(16);
 
-        let mut reactor = SenderReactor::new(100, control_rx);
+        let mut reactor = SenderReactor::new(100, control_rx, None);
 
         let handle = tokio::spawn(async move {
             // Green (normal)
@@ -1051,7 +1063,7 @@ mod tests {
     #[tokio::test]
     async fn test_queue_status_reaches_sender_reactor() {
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(16);
-        let mut reactor = SenderReactor::new(1000, control_rx);
+        let mut reactor = SenderReactor::new(1000, control_rx, None);
 
         // Spawn a task that sends a QueueStatus with 60% occupancy (Yellow zone)
         let handle = tokio::spawn(async move {

@@ -169,13 +169,10 @@ impl CommitGate {
             return Err(());
         }
 
-        // Flush after each chunk to ensure data durability if the process
-        // is terminated before the final shutdown flush.
-        if let Err(e) = self.writer.flush().await {
-            error!("commit gate: flush error: {}", e);
-            self.stats.write_errors.fetch_add(1, Ordering::Relaxed);
-            return Err(());
-        }
+        // NOTE: No per-chunk flush. BufWriter handles its own internal buffering
+        // (default 8KB) and the final flush() in run() ensures all data is written
+        // before exit. Per-chunk flushes are expensive and provide no durability
+        // benefit for streaming output — only the final flush matters.
 
         self.stats
             .bytes_written

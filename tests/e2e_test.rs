@@ -600,9 +600,10 @@ async fn test_crc_integrity() {
     use braid::protocol::headers::{ChunkHeader, FragmentHeader};
     use bytes::BytesMut;
 
+    let receiver_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
     let mut reassembler =
-        braid::receiver::reassembly::FragmentReassembler::new(tx, 1024 * 1024, 60, braid::buffer::pool::BufferPool::new(4, 65536));
+        braid::receiver::reassembly::FragmentReassembler::new(tx, 1024 * 1024, 60, braid::buffer::pool::BufferPool::new(4, 65536), receiver_bytes);
 
     let chunk_data = b"chunk crc integrity test across fragments";
     let wrong_crc = 0xDEADBEEF;

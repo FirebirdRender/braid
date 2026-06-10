@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -213,12 +215,13 @@ impl BraidReceive {
         // Used after completion to detect write errors in file mode.
         let commit_gate_stats = commit_gate.stats_arc();
 
-        let monitor_pool = buffer_pool.clone();
+        let receiver_bytes = Arc::new(AtomicUsize::new(0));
+
         let mut monitor = ReceiverMonitor::new(
-            monitor_pool,
             max_inflight,
             control_tx,
             DEFAULT_STATUS_INTERVAL,
+            receiver_bytes.clone(),
         );
 
         let mut progress = ProgressReporter::new(DEFAULT_PROGRESS_INTERVAL, self.verbosity);
@@ -331,7 +334,7 @@ let fragment = Bytes::copy_from_slice(&pool_buf.buffer[..n]);
         for (i, rx) in fragment_rxs.into_iter().enumerate() {
             let tx = reassembly_tx.clone();
             let mut reassembler =
-                FragmentReassembler::new(tx, max_inflight, DEFAULT_CHUNK_TIMEOUT_SECS, buffer_pool.clone());
+                FragmentReassembler::new(tx, max_inflight, DEFAULT_CHUNK_TIMEOUT_SECS, buffer_pool.clone(), receiver_bytes.clone());
             let handle = tokio::spawn(async move {
                 info!("fragment reassembler {} started", i);
                 let mut rx = rx;
@@ -357,7 +360,7 @@ let fragment = Bytes::copy_from_slice(&pool_buf.buffer[..n]);
                             }
                         }
                         _ = timeout_check.tick() => {
-                            reassembler.check_timeouts();
+                            reassembler.check_timeouts().await;
                         }
                     }
                 }
@@ -878,7 +881,8 @@ mod tests {
     fn fragment_reassembler_creation() {
         let (tx, _rx) = mpsc::channel::<Bytes>(16);
         let pool = braid::buffer::pool::BufferPool::new(4, 65536);
-        let reassembler = FragmentReassembler::new(tx, 1024 * 1024, 60, pool);
+        let receiver_bytes = Arc::new(AtomicUsize::new(0));
+        let reassembler = FragmentReassembler::new(tx, 1024 * 1024, 60, pool, receiver_bytes);
         assert_eq!(reassembler.in_flight_count(), 0);
         assert_eq!(reassembler.inflight_bytes(), 0);
     }
@@ -911,9 +915,9 @@ mod tests {
 
     #[test]
     fn receiver_monitor_creation() {
-        let pool = BufferPool::new(10, 1024);
         let (control_tx, _control_rx) = mpsc::channel::<braid::protocol::ControlMessage>(16);
-        let monitor = ReceiverMonitor::new(pool, 10, control_tx, Duration::from_secs(1));
+        let receiver_bytes = Arc::new(AtomicUsize::new(0));
+        let monitor = ReceiverMonitor::new(10, control_tx, Duration::from_secs(1), receiver_bytes);
         assert_eq!(
             monitor.controller().level(),
             braid::flow::FullnessLevel::Green

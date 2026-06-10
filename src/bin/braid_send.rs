@@ -565,7 +565,8 @@ impl BraidSend {
             mpsc::channel::<braid::protocol::ControlMessage>(16);
         let (reconnect_resp_tx, mut reconnect_resp_rx) =
             mpsc::channel::<braid::protocol::ControlMessage>(16);
-        let mut sender_reactor = SenderReactor::new(1024, queue_status_rx);
+        let (flow_pause_tx, _flow_pause_rx) = mpsc::channel::<bool>(16);
+        let mut sender_reactor = SenderReactor::new(1024, queue_status_rx, Some(flow_pause_tx));
         let flow_handle = tokio::spawn(async move {
             info!("flow sender reactor started");
             sender_reactor.run().await;

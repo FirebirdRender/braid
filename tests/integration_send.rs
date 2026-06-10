@@ -156,7 +156,7 @@ async fn test_sender_reactor_creation() {
     use tokio::sync::mpsc;
     let (_control_tx, control_rx) = mpsc::channel(16);
 
-    let reactor = SenderReactor::new(100, control_rx);
+    let reactor = SenderReactor::new(100, control_rx, None);
     assert_eq!(
         reactor.controller().level(),
         braid::flow::FullnessLevel::Green
@@ -279,7 +279,7 @@ async fn test_flow_control_wiring() {
 
     let (control_tx, control_rx) = mpsc::channel(16);
 
-    let mut reactor = SenderReactor::new(100, control_rx);
+    let mut reactor = SenderReactor::new(100, control_rx, None);
 
     let handle = tokio::spawn(async move {
         reactor.run().await;
