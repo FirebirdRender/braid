@@ -800,6 +800,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_backpressure_full_lifecycle_pause_and_resume() {
+        let (bp_tx, mut bp_rx) = mpsc::channel::<bool>(16);
+        let (mut mgr, receivers) = make_manager_with_bp(2, bp_tx);
+        mgr.high_watermark = 100;
+
+        // Phase 1: All workers below watermark → resume signal
+        mgr.workers[0].stats.pending_bytes.store(50, Ordering::Relaxed);
+        mgr.workers[1].stats.pending_bytes.store(50, Ordering::Relaxed);
+        mgr.check_backpressure();
+        let sig = tokio::time::timeout(Duration::from_millis(200), bp_rx.recv())
+            .await
+            .expect("phase 1: timeout")
+            .expect("phase 1: channel closed");
+        assert!(!sig, "phase 1: should be resume (false) when all below watermark");
+
+        // Phase 2: All workers exceed watermark → pause signal
+        mgr.workers[0].stats.pending_bytes.store(200, Ordering::Relaxed);
+        mgr.workers[1].stats.pending_bytes.store(200, Ordering::Relaxed);
+        mgr.check_backpressure();
+        let sig = tokio::time::timeout(Duration::from_millis(200), bp_rx.recv())
+            .await
+            .expect("phase 2: timeout")
+            .expect("phase 2: channel closed");
+        assert!(sig, "phase 2: should be pause (true) when all exceed watermark");
+
+        // Phase 3: Workers drain below watermark → resume signal again
+        mgr.workers[0].stats.pending_bytes.store(50, Ordering::Relaxed);
+        mgr.workers[1].stats.pending_bytes.store(50, Ordering::Relaxed);
+        mgr.check_backpressure();
+        let sig = tokio::time::timeout(Duration::from_millis(200), bp_rx.recv())
+            .await
+            .expect("phase 3: timeout")
+            .expect("phase 3: channel closed");
+        assert!(!sig, "phase 3: should be resume (false) when workers drain below watermark");
+
+        // Phase 4: Still below watermark → resume is idempotent (duplicate false is harmless)
+        mgr.workers[0].stats.pending_bytes.store(30, Ordering::Relaxed);
+        mgr.check_backpressure();
+        let sig = tokio::time::timeout(Duration::from_millis(200), bp_rx.recv())
+            .await
+            .expect("phase 4: timeout")
+            .expect("phase 4: channel closed");
+        assert!(!sig, "phase 4: should be resume (false) — idempotent");
+
+        drop(receivers);
+    }
+
+    #[tokio::test]
     async fn backpressure_not_signalled_when_one_worker_below_watermark() {
         let (bp_tx, mut bp_rx) = mpsc::channel::<bool>(16);
         let (mut mgr, receivers) = make_manager_with_bp(2, bp_tx);
