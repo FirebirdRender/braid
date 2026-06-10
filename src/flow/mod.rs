@@ -499,8 +499,14 @@ impl SenderReactor {
             ControlMessage::QueueStatus {
                 queued_chunks,
                 queued_bytes,
-                total_capacity: _,
+                total_capacity,
             } => {
+                let old = self.controller.total_capacity();
+                let new = total_capacity as usize;
+                if old != new {
+                    info!("flow: updating capacity from QueueStatus: {} → {}", old, new);
+                }
+                self.set_capacity(total_capacity as usize);
                 self.controller.stats.record_status_received();
                 self.handle_queue_status(queued_chunks as usize, queued_bytes as usize)
                     .await;
@@ -564,6 +570,11 @@ impl SenderReactor {
     /// Returns a reference to the flow controller.
     pub fn controller(&self) -> &FlowController {
         &self.controller
+    }
+
+    /// Update the total_capacity on the underlying flow controller.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.controller.set_total_capacity(capacity);
     }
 }
 

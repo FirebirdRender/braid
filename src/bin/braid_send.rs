@@ -565,7 +565,7 @@ impl BraidSend {
             mpsc::channel::<braid::protocol::ControlMessage>(16);
         let (reconnect_resp_tx, mut reconnect_resp_rx) =
             mpsc::channel::<braid::protocol::ControlMessage>(16);
-        let (flow_pause_tx, _flow_pause_rx) = mpsc::channel::<bool>(16);
+        let (flow_pause_tx, mut flow_pause_rx) = mpsc::channel::<bool>(16);
         let mut sender_reactor = SenderReactor::new(1024, queue_status_rx, Some(flow_pause_tx));
         let flow_handle = tokio::spawn(async move {
             info!("flow sender reactor started");
@@ -573,23 +573,32 @@ impl BraidSend {
             info!("flow sender reactor finished");
         });
 
-        // Spawn backpressure handler
-        let bp_shutdown = shutdown.clone();
-        let bp_handle = tokio::spawn(async move {
-            info!("backpressure handler started");
-            while let Some(paused) = bp_rx.recv().await {
-                if bp_shutdown.is_shutting_down() {
+        // Spawn merge governor: local_paused (QueueManager bp_rx) || remote_paused (SenderReactor flow_pause_rx)
+        let merge_handle = tokio::spawn(async move {
+            let mut local_paused = false;
+            let mut remote_paused = false;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    paused = bp_rx.recv() => {
+                        match paused {
+                            Some(p) => local_paused = p,
+                            None => break,
+                        }
+                    }
+                    paused = flow_pause_rx.recv() => {
+                        match paused {
+                            Some(p) => remote_paused = p,
+                            None => break,
+                        }
+                    }
+                }
+                let should_pause = local_paused || remote_paused;
+                if splitter_pause_tx.send(should_pause).await.is_err() {
                     break;
                 }
-                if paused {
-                    info!("backpressure: pausing splitter");
-                    let _ = splitter_pause_tx.send(true).await;
-                } else {
-                    info!("backpressure: resuming splitter");
-                    let _ = splitter_pause_tx.send(false).await;
-                }
             }
-            info!("backpressure handler finished");
         });
 
         // Spawn ProgressReporter tick loop
@@ -950,7 +959,7 @@ impl BraidSend {
         let _ = control_recv_handle.await;
 
         let _ = progress_handle.await;
-        let _ = bp_handle.await;
+        let _ = merge_handle.await;
         for handle in worker_handles {
             let _ = handle.await;
         }
